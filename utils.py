@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 import tensorflow as tf
 import numpy as np
 import random
-
+import keras_hub
 # from ml4h.tensormap.ukb.ecg import ecg_rest_median_raw_10
 # from ml4h.tensormap.ukb.mri import lax_4ch_heart_center
 # from ml4h.tensormap.ukb.mri_brain import t1_mni_slices_128_160
@@ -56,6 +56,10 @@ class MultimodalUKBDataset(Dataset):
         return samples, int(sample_id)
 
 
+class MultimodalID3Dataset(Dataset): 
+    def __init__(self):
+        super().__init__()
+
 def load_pretrained_models(decoder_path_1, encoder_path_1, decoder_path_2, encoder_path_2):
     decoder_1 = tf.keras.models.load_model(decoder_path_1)
     encoder_1 = tf.keras.models.load_model(encoder_path_1)
@@ -65,6 +69,16 @@ def load_pretrained_models(decoder_path_1, encoder_path_1, decoder_path_2, encod
     decoder_1 = randomize_model_weight(decoder_1)
     decoder_2 = randomize_model_weight(decoder_2)
     return decoder_1, encoder_1, decoder_2, encoder_2
+
+def load_pretrained_hub_models(encoder_preset_1,
+                               encoder_preset_2): 
+    encoder1 = keras_hub.models.DINOV2Backbone.from_preset(
+            encoder_preset_1
+        )
+    encoder2 = keras_hub.models.BertBackbone.from_preset(
+        encoder_preset_2
+    )
+    return encoder1, encoder2
 
 
 def load_data(sample_list, data_paths, n_train=None, test_ratio=0.01, data='UKB', get_trainset=False):

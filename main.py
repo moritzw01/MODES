@@ -3,6 +3,8 @@ import sys
 import os
 import numpy as np
 import argparse
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"
 sys.path.append('/home/sana/ml4h')
 sys.path.append('/home/sana')
 import tensorflow as tf
@@ -19,6 +21,8 @@ from utils import *
 
 tf.keras.callbacks.TerminateOnNaN()
 tf.config.list_physical_devices('GPU')
+
+import keras_hub
 
 parser = argparse.ArgumentParser(description='DeMuRe Fusion')
 parser.add_argument('--log_path', default='/home/sana/multimodal/logs/out.txt')
@@ -52,6 +56,10 @@ def main():
     data_paths = {M1:configs[M1]["raw_data_path"], M2:configs[M2]["raw_data_path"]}
     
     # Load pretrain models.
+    encoder_1, encoder_2 = load_pretrained_hub_models(
+        "dinov2_base",
+        "bert_small_en_uncased"
+    )
     decoder_1, encoder_1, decoder_2, encoder_2 = load_pretrained_models(decoder_path_1=configs[M1]["decoder_path"], 
                                                                         encoder_path_1=configs[M1]["encoder_path"],
                                                                         decoder_path_2=configs[M2]["decoder_path"], 

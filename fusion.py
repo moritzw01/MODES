@@ -429,6 +429,13 @@ class DeMuReFusion():
 
 
 class DeMuReFusionMI(DeMuReFusion): 
+    """
+    implements a Mutual Information Loss function for the recreation error 
+    with a CLUB based Mutual Information estimation based on the batch size. 
+    The Loss function is described as following: 
+    L = L_recreation + l_1 * MI( X; Z_shared , Z_specific)  
+    """
+    
     def __init__(self,
                  encoders,
                  decoders,
@@ -444,18 +451,44 @@ class DeMuReFusionMI(DeMuReFusion):
                  lr = 1e-4,
                  batch_size = 100,
                  num_iter = 5000,
-                 estimator_name = "CLUB" ):
+                 l1 = 0.5, 
+                 estimator_name = "CLUB"):
         super().__init__(encoders, decoders, train_ids, z_sizes, shared_size, modality_names, modality_shapes, ckpt_path, gamma, mask, beta)
+        
         self.mi_lr = lr
         self.mi_batch_size = batch_size
         self.mi_num_iter = num_iter
-        # calculate from modes output 
-        self.sample_dim = 0
-        self.hidden_size = 0
+        self.l1 = l1 # amount of MI on the Loss function 
+
+        # self.estimator_name = estimator_name
+        # self.mi_estimators = eval(estimator_name)(self.sample_dim, self.sample_dim, self.hidden_size).cuda()
+        # self.mi_optimizer = torch.optim.Adam(self.mi_estimator.parameters(), lr = lr)
 
         self.estimator_name = estimator_name
-        self.mi_estimator = eval(estimator_name)(self.sample_dim, self.sample_dim, self.hidden_size).cuda()
-        self.mi_optimizer = torch.optim.Adam(self.mi_estimator.parameters(), lr = lr)
+
+        self.mi_estimators = torch.nn.ModuleDict()
+        self.mi_optimizers = {}
+
+        for mod_name, z_size in self.z_sizes.items():
+
+            shared_dim = self.shared_size
+            specific_dim = z_size
+
+            hidden_size = max(
+                64,
+                min(256, 2 * max(shared_dim, specific_dim))
+            )
+
+            self.mi_estimators[mod_name] = eval(self.estimator_name)(
+                shared_dim,
+                specific_dim,
+                hidden_size
+            ).to("cuda")
+
+            self.mi_optimizers[mod_name] = torch.optim.Adam(
+                self.mi_estimators[mod_name].parameters(),
+                lr=lr
+            )
 
     def optimize_modality_latent(self, trainloader, lr, n_epochs, optimizers):
             loss_fn = tf.keras.losses.MeanSquaredError()
@@ -472,6 +505,7 @@ class DeMuReFusionMI(DeMuReFusion):
                     batch_loss = 0
                     for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
                         with tf.GradientTape() as tape:
+                            mutual_info_est = 0 
                             loss = 0
                             trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
                             x_m = tf.convert_to_tensor(data[mod])
@@ -479,10 +513,16 @@ class DeMuReFusionMI(DeMuReFusion):
                             noise_m = tf.random.normal(shape=(batch_size ,self.z_sizes[mod]), mean=0.0, stddev=0.1)
                             noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
                             prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
+                            # other modality shared vector 
                             _, z_s_other, _ = self.encoders[prev_modality](tf.convert_to_tensor(data[prev_modality]))
                             z_s_other = z_s_other+noise_s
+                            # modality specific part = posterior means modality specific 
                             z_m = z[batch_ind:batch_ind+batch_size]+noise_m
+                            # MI estimation for every modality = mean posterior_m 
+                            mutual_info_est += self.mi_estimators[mod](z_m, z_s_other)
+
                             mse = self.posterior_means[mod][batch_ind:batch_ind+batch_size]**2
+
                             if self.mask:
                                 loss += (0.1*self.beta*(self.shared_mask.l1())+self.gamma*(self.shared_mask.entropy_regularization())) 
                                 z_s_other = self.shared_mask(z_s_other)
@@ -490,12 +530,22 @@ class DeMuReFusionMI(DeMuReFusion):
                             reconst = self.decoders[mod](tf.concat([z_m, z_s_other], -1))
                             loss += loss_fn(x_m, reconst)
                             loss += 0.01*tf.reduce_mean(mse)
+                            # extended loss 
+                            loss += self.l1 * mutual_info_est
                             trainable_var.extend([self.posterior_means[mod]])
                             trainable_var.extend(self.decoders[mod].trainable_variables)
                         gradients = tape.gradient(loss, trainable_var)
                         optimizers[m_ind].apply_gradients(zip(gradients, trainable_var))
                         batch_loss += loss.numpy()
                         del tape
+
+                        # MI estimator retrain to fit to changed latent space 
+                        # club estimates latent due to conditional propbability 
+                        # --> direction of inputs is relevant 
+                        # want to est MI based on model p(specific | shared)  
+                        x_samples, y_samples = z_m, z_s_other
+                        self.train_CLUB(mod, x_samples, y_samples)
+
                     batch_ind += batch_size     
                     epoch_loss.append(batch_loss) 
                 loss_trend.append(np.mean(epoch_loss))      
@@ -555,6 +605,15 @@ class DeMuReFusionMI(DeMuReFusion):
                     np.save(os.path.join(self.ckpt_path,'mask_%s_bin'%mod), self.modality_masks[mod].binary_mask.numpy())
                 np.save(os.path.join(self.ckpt_path,"shared_z"), self.shared_post_mean.numpy())
             return loss_trend
+
+    def train_CLUB(self, mod, x_samples, y_samples): 
+        for j in range(5):
+            self.mi_estimators[mod].train()
+            mi_loss = self.mi_estimators[mod].learning_loss(x_samples, y_samples)
+            self.mi_optimizers[mod].zero_grad()
+            mi_loss.backward()
+            self.mi_optimizers[mod].step()
+        return 
 
 
 class LearnableMask(keras.layers.Layer):
