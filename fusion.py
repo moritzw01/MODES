@@ -5,7 +5,6 @@ import numpy as np
 import os
 from sklearn.decomposition import PCA
 import gc
-from utils import MultimodalUKBDataset
 #for TF2
 import tensorflow_probability as tfp
 from tensorflow_probability.python.distributions import logistic
@@ -34,14 +33,13 @@ class DeMuReFusion():
         mask (bool): If ture, the framwork uses a trainable masks to learn the optimal size of the latent space.
         beta (float): A hyperparameter for l1 regularization of the masks.
     """
-    def __init__(self, encoders, decoders, train_ids, z_sizes, shared_size,
+    def __init__(self, encoders, decoders, num_train_samples, z_sizes, shared_size,
                  modality_names, modality_shapes, ckpt_path, gamma=1, mask=False, beta=1):
         super(DeMuReFusion, self).__init__()
         self.mask = mask
         self.z_sizes = z_sizes
         self.shared_size = shared_size
-        self.train_ids = [int(train_ids[idx].split('.')[0]) for idx in range(len(train_ids))]
-        self.n_train = len(train_ids)
+        self.n_train = num_train_samples
         self.n_modalitites = len(modality_names)
         self.modality_names = modality_names
         self.modality_shapes = modality_shapes
@@ -439,7 +437,7 @@ class DeMuReFusionMI(DeMuReFusion):
     def __init__(self,
                  encoders,
                  decoders,
-                 train_ids,
+                 num_train_samples,
                  z_sizes,
                  shared_size,
                  modality_names,
@@ -453,7 +451,7 @@ class DeMuReFusionMI(DeMuReFusion):
                  num_iter = 5000,
                  l1 = 0.5, 
                  estimator_name = "CLUB"):
-        super().__init__(encoders, decoders, train_ids, z_sizes, shared_size, modality_names, modality_shapes, ckpt_path, gamma, mask, beta)
+        super().__init__(encoders, decoders, num_train_samples, z_sizes, shared_size, modality_names, modality_shapes, ckpt_path, gamma, mask, beta)
         
         self.mi_lr = lr
         self.mi_batch_size = batch_size

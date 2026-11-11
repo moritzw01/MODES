@@ -28,37 +28,9 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-
-class MultimodalUKBDataset(Dataset):
-    def __init__(self, paths, file_names):
-        self.paths = paths
-        self.file_names = file_names
-
-    def __len__(self):
-        return len(self.file_names)
-    
-    def batch_normalize(self,x, std=1):
-        return std*(x-torch.mean(x))/torch.std(x)
-
-    def __getitem__(self, idx):
-        sample_id = self.file_names[idx].split('.')[0]
-        samples = {}
-        for modal_name, p in self.paths.items():
-            sample_path = os.path.join(p, self.file_names[idx])
-            with h5py.File(f'{sample_path}', 'r') as hd5:
-                if "ecg" in modal_name:
-                    sample = ecg_rest_median_raw_10.normalize(ecg_rest_median_raw_10.tensor_from_file(ecg_rest_median_raw_10, hd5))
-                elif "lax" in modal_name:
-                    sample = lax_4ch_heart_center.normalize(lax_4ch_heart_center.tensor_from_file(lax_4ch_heart_center, hd5))
-                elif "axial" in modal_name:
-                    sample = t1_mni_slices_128_160.normalize(t1_mni_slices_128_160.tensor_from_file(t1_mni_slices_128_160, hd5))
-            samples[modal_name] = (torch.Tensor(sample))
-        return samples, int(sample_id)
+from data import Multimodal3DIdent, MultimodalUKBDataset
 
 
-class MultimodalID3Dataset(Dataset): 
-    def __init__(self):
-        super().__init__()
 
 def load_pretrained_models(decoder_path_1, encoder_path_1, decoder_path_2, encoder_path_2):
     decoder_1 = tf.keras.models.load_model(decoder_path_1)

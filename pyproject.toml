@@ -9,12 +9,14 @@ dependencies = [
     "keras-hub>=0.31.0",
     "matplotlib>=3.11.2",
     "ml4h",
+    "nltk>=3.10.4",
     "pandas>=2.3.3",
     "scikit-learn>=1.9.1",
     "seaborn>=0.13.2",
     "tensorflow==2.19.0",
     "tensorflow-probability>=0.25.0",
     "torch==2.2.2",
+    "torchvision>=0.17.2",
 ]
 
 [tool.uv.sources]

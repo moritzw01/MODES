@@ -10,7 +10,7 @@ sys.path.append('/home/sana')
 import tensorflow as tf
 import json
 import keras 
-
+from pathlib import Path
 import matplotlib.pyplot as plt
 import random
 import seaborn as sns
@@ -24,17 +24,21 @@ tf.config.list_physical_devices('GPU')
 
 import keras_hub
 
+from models import BERTDecoder, DINOv2Decoder
+from data import Multimodal3DIdent
+
 parser = argparse.ArgumentParser(description='DeMuRe Fusion')
-parser.add_argument('--log_path', default='/home/sana/multimodal/logs/out.txt')
-parser.add_argument('--plot_path', default='/home/sana/multimodal/plots/')
-parser.add_argument('--ckpt_path', default='/home/sana/multimodal/ckpts/')
+parser.add_argument('--log_path', default='/home/apxye/multimodal/ID3/logs/out.txt')
+parser.add_argument('--plot_path', default='/home/apxye/multimodal/ID3/plots')
+parser.add_argument('--ckpt_path', default='/home/apxye/multimodal/ID3/checkpoints')
+parser.add_argument('--data_dir')
 parser.add_argument('--zm_size', default=400, type=int)
 parser.add_argument('--zs_size', default=600, type=int)
 parser.add_argument('--beta', default=1e-6)
 parser.add_argument('--gamma', default=1)
 parser.add_argument('--n_samples', default=1000, type=int)
 parser.add_argument('--n_epochs', default=10, type=int)
-parser.add_argument('--modality_names', nargs='+', default=['input_ecg_rest_median_raw_10_continuous', 'input_lax_4ch_heart_center_continuous'])
+parser.add_argument('--modality_names', nargs='+', default=['img', 'txt'])
 
 
 def main():
@@ -53,29 +57,35 @@ def main():
 
     M1 = args.modality_names[0]
     M2 = args.modality_names[1]
-    data_paths = {M1:configs[M1]["raw_data_path"], M2:configs[M2]["raw_data_path"]}
+    #data_paths = {M1:configs[M1]["raw_data_path"], M2:configs[M2]["raw_data_path"]}
     
     # Load pretrain models.
     encoder_1, encoder_2 = load_pretrained_hub_models(
         "dinov2_base",
         "bert_small_en_uncased"
     )
-    decoder_1, encoder_1, decoder_2, encoder_2 = load_pretrained_models(decoder_path_1=configs[M1]["decoder_path"], 
-                                                                        encoder_path_1=configs[M1]["encoder_path"],
-                                                                        decoder_path_2=configs[M2]["decoder_path"], 
-                                                                        encoder_path_2=configs[M2]["encoder_path"])
+    img_dim =  encoder_1.output_shape[-1]
+    text_dim = encoder_2.output_shape[-1]
+    decoder_1, decoder_2 = DINOv2Decoder(), BERTDecoder()
 
     # Load data
-    sample_list = get_paired_id_list(data_paths, from_file=False, file_name="/home/sana/multimodal/data_list.pkl")
-    print("Total number of samples: ", len(sample_list))
-    train_loader, _, _, list_ids = load_data(sample_list, n_train=args.n_samples, data_paths=data_paths, test_ratio=0.01)
-
+    data_dir = Path(args.data_dir) 
+    train_path = data_dir / "train"
+    val_path = data_dir / "val"
+    test_path = data_dir / "test"
+    trainset = Multimodal3DIdent(train_path, mode="train")
+    valset = Multimodal3DIdent(val_path, mode="val")
+    testset = Multimodal3DIdent(test_path, mode="test")
+    train_loader = DataLoader(trainset, batch_size=64, shuffle=False, drop_last=False)
+    valid_loader = DataLoader(valset, batch_size=64, shuffle=False, drop_last=False)
+    test_loader = DataLoader(testset, batch_size=64, shuffle=False, drop_last=False)
+    
     # Train the dissentangler 
     rep_disentangler = DeMuReFusion(encoders={M1: encoder_1, M2:encoder_2}, 
                                  decoders={M1: decoder_1, M2:decoder_2}, 
-                                 train_ids=list_ids[0], shared_size=args.zs_size, modality_names=args.modality_names, 
+                                 num_train_samples=trainset.__len__, shared_size=args.zs_size, modality_names=args.modality_names, 
                                  z_sizes={M1:args.zm_size, M2:args.zm_size},
-                                 modality_shapes={M1:configs[M1]["input_size"], M2:configs[M2]["input_size"]},
+                                 modality_shapes={M1: img_dim, M2: text_dim},
                                  mask=True, beta=args.beta, gamma=args.gamma, ckpt_path=args.ckpt_path)  
     del decoder_1, encoder_1, encoder_2, decoder_2
 
