@@ -4,20 +4,20 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
+
 dependencies = [
     "keras>=3.15.1",
     "keras-hub>=0.31.0",
     "matplotlib>=3.11.2",
-    "ml4h",
     "nltk>=3.10.4",
+    "numpy>=2.1.0",
     "pandas>=2.3.3",
+    "pydantic>=2.14.3",
     "scikit-learn>=1.9.1",
     "seaborn>=0.13.2",
     "tensorflow==2.19.0",
     "tensorflow-probability>=0.25.0",
-    "torch==2.2.2",
-    "torchvision>=0.17.2",
+    "tf-keras==2.19.0",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
 ]
-
-[tool.uv.sources]
-ml4h = { path = "../../../../../Downloads/ml4h-0.1.4", editable = true }

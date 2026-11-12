@@ -28,9 +28,39 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from data import Multimodal3DIdent, MultimodalUKBDataset
+from data import Multimodal3DIdent, MultimodalUKBDataset, MultiModalSample, TextModality, ImageModality
 
+import numpy as np
+def get_dataloader_input_size(dataloader: DataLoader):
+    """
+    Holt sich einen Batch aus dem DataLoader und gibt die Shape 
+    (bzw. Input-Size) des ersten Elements (der Eingabedaten) zurück.
+    """
+    # Iterator über den DataLoader erstellen und den ersten Batch holen
+    batch = next(iter(dataloader))
 
+    if isinstance(batch, (list, tuple, np.ndarray)): 
+        return batch[0].shape
+    elif isinstance(batch,  MultiModalSample): 
+        image_mod = batch.image
+        text_mod = batch.text
+        return image_mod.data.shape, text_mod.one_hot.shape 
+
+def print_sample_shapes(item, prefix=""):
+    """
+    Durchläuft ein Sample (Dict, Liste, Tensor etc.) rekursiv 
+    und gibt die Shapes aller enthaltenen PyTorch-Tensoren aus.
+    """
+    if isinstance(item, dict):
+        for key, value in item.items():
+            print_sample_shapes(value, prefix=f"{prefix}.{key}" if prefix else key)
+    elif isinstance(item, (list, tuple)):
+        for i, value in item.items() if hasattr(item, 'items') else enumerate(item):
+            print_sample_shapes(value, prefix=f"{prefix}[{i}]")
+    elif torch.is_tensor(item):
+        print(f"  {prefix}: {item.shape}")
+    else:
+        print(f"  {prefix}: {type(item)} (kein Tensor)")
 
 def load_pretrained_models(decoder_path_1, encoder_path_1, decoder_path_2, encoder_path_2):
     decoder_1 = tf.keras.models.load_model(decoder_path_1)

@@ -72,9 +72,21 @@ class DeMuReFusion():
             self.modality_masks[modality_name].trainable = trainable
         self.shared_mask.trainable = trainable
 
-    def _add_disentangled_block(self,encoder, decoder, input_size, z_s_size, z_m_size, trainable=False):
+    def _layers_un_freeze(self, model, trainable): 
+        for layer in model.layers:
+            layer.trainable = trainable
+        return model 
+    
+    def _add_disentangled_block(self,
+                                encoder: keras.models.Model,
+                                decoder: keras.models.Model,
+                                input_size,
+                                z_s_size,
+                                z_m_size,
+                                trainable=False):
         for layer in encoder.layers:
             layer.trainable = False
+        
         inputs = keras.Input(shape=input_size, dtype=tf.float32)
         x = encoder(inputs, training=False)
         output1 = keras.layers.Dense(z_m_size, name='modality')(x[0])

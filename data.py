@@ -222,6 +222,7 @@ class Multimodal3DIdent(Dataset):
         if self.transform is not None:
             image = self.transform(image)
 
+        image_mod = ImageModality(image, img_name)
         # load text
         words = self.text_in_words[idx]
         words = words + ["{eos}"]
@@ -230,6 +231,7 @@ class Multimodal3DIdent(Dataset):
         indices_onehot = torch.nn.functional.one_hot(
             torch.Tensor(indices).long(), self.vocab_size).float()
 
+        text_mod = TextModality(indices, indices_onehot, words)
         # load labels
         if self.has_labels:
             z_image = {k: v[idx] for k, v in self.labels["z_image"].items()}
@@ -237,18 +239,48 @@ class Multimodal3DIdent(Dataset):
         else:
             z_image, z_text = None, None
 
-        sample = {
-            "image": image,
-            "text": indices_onehot,
-            "z_image": z_image,
-            "z_text": z_text}
+        sample = MultiModalSample(
+            image_mod, 
+            text_mod,
+            z_image,
+            z_text
+        )
         return sample
 
     def __len__(self):
         return self.num_samples
 
 
+from dataclasses import dataclass
+import torch
+import numpy as np
 
+@dataclass
+class ImageModality:
+    data: torch.Tensor
+    name: str
+    
+    @property
+    def shape(self):
+        return self.data.shape
+
+@dataclass
+class TextModality:
+    indices: torch.Tensor
+    one_hot: torch.Tensor
+    words: list[str]
+    
+    @property
+    def shape(self):
+        return self.one_hot.shape
+
+@dataclass
+class MultiModalSample:
+    image: ImageModality
+    text: TextModality
+    z_image: dict | None = None
+    z_text: dict | None = None
+    id: int 
 
 
 
