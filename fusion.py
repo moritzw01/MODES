@@ -34,7 +34,8 @@ class DeMuReFusion():
         beta (float): A hyperparameter for l1 regularization of the masks.
     """
     def __init__(self, encoders, decoders, num_train_samples, z_sizes, shared_size,
-                 modality_names, modality_shapes, ckpt_path, gamma=1, mask=False, beta=1):
+                 modality_names, modality_shapes, ckpt_path, gamma=1, mask=False, beta=1, representation_fns=None):
+        
         super(DeMuReFusion, self).__init__()
         self.mask = mask
         self.z_sizes = z_sizes
@@ -46,6 +47,7 @@ class DeMuReFusion():
         self.beta = beta
         self.gamma = gamma
         self.ckpt_path = ckpt_path
+        self.representation_fns = representation_fns or {}
         # Initialize latent representations
         self.posterior_means = {}
         for mod, z_size in z_sizes.items():
@@ -63,9 +65,11 @@ class DeMuReFusion():
         for model_name in modality_names:
             encoder, decoder = self._add_disentangled_block(encoders[model_name], decoders[model_name], 
                                                             modality_shapes[model_name], z_s_size=shared_size, 
-                                                            z_m_size=z_sizes[model_name], trainable=True)
+                                                            z_m_size=z_sizes[model_name],
+                                                            representation_fn=representation_fns[model_name],trainable=True)
             self.encoders[model_name] = encoder
             self.decoders[model_name] = decoder
+
 
     def _set_trainable_mask(self, trainable):
         for modality_name, z_size in self.z_sizes.items():
@@ -76,35 +80,122 @@ class DeMuReFusion():
         for layer in model.layers:
             layer.trainable = trainable
         return model 
+
     
-    def _add_disentangled_block(self,
-                                encoder: keras.models.Model,
-                                decoder: keras.models.Model,
-                                input_size,
-                                z_s_size,
-                                z_m_size,
-                                trainable=False):
+    # def _add_disentangled_block(self,
+    #                             encoder: keras.models.Model,
+    #                             decoder: keras.models.Model,
+    #                             input_size,
+    #                             z_s_size,
+    #                             z_m_size,
+    #                             trainable=False):
+    #     for layer in encoder.layers:
+    #         layer.trainable = False
+        
+    #     inputs = keras.Input(shape=input_size, dtype=tf.float32)
+    #     x = encoder(inputs, training=False)
+    #     output1 = keras.layers.Dense(z_m_size, name='modality')(x[0])
+    #     # fc = keras.layers.Dense(512, name='fc', activation='relu')(x[0])
+    #     output2 = keras.layers.Dense(z_s_size, name='shared')(x[0])
+    #     encoder = keras.models.Model(inputs=inputs, outputs=[output1, output2, x[0]])
+    #     reps = keras.layers.Input(shape=(z_m_size+z_s_size,), dtype=tf.float32) 
+    #     x1 = keras.layers.Dense(256, name='fusion')(reps)
+    #     reconst = decoder(x1)
+    #     decoder = tf.keras.models.Model(inputs=(reps), outputs=reconst[0])
+    #     # Randomize decoder weights if the decoder is pretrained 
+    #     for layer in decoder.layers:
+    #         if hasattr(layer, 'kernel_initializer') and hasattr(layer, 'kernel'):
+    #             layer.kernel.assign(layer.kernel_initializer(layer.kernel.shape))
+    #         if hasattr(layer, 'bias_initializer') and hasattr(layer, 'bias'):
+    #             layer.bias.assign(layer.bias_initializer(layer.bias.shape))
+    #     for layer in decoder.layers:
+    #         layer.trainable = True
+    #     return encoder, decoder
+
+    def _add_disentangled_block(
+        self,
+        encoder: keras.models.Model,
+        decoder: keras.models.Model,
+        input_size,
+        z_s_size,
+        z_m_size,
+        representation_fn,
+        trainable=False):
+
         for layer in encoder.layers:
             layer.trainable = False
-        
-        inputs = keras.Input(shape=input_size, dtype=tf.float32)
+
+        # Create modality-specific inputs
+        inputs = create_encoder_inputs(encoder, input_size)
+
+        # Forward pass
         x = encoder(inputs, training=False)
-        output1 = keras.layers.Dense(z_m_size, name='modality')(x[0])
-        # fc = keras.layers.Dense(512, name='fc', activation='relu')(x[0])
-        output2 = keras.layers.Dense(z_s_size, name='shared')(x[0])
-        encoder = keras.models.Model(inputs=inputs, outputs=[output1, output2, x[0]])
-        reps = keras.layers.Input(shape=(z_m_size+z_s_size,), dtype=tf.float32) 
+
+        representation = representation_fn(x)
+
+        output1 = keras.layers.Dense(z_m_size, name='modality')(representation)
+        output2 = keras.layers.Dense(z_s_size, name='shared')(representation)
+        # print("Encoder output type:", type(x))
+
+        # if isinstance(x, dict):
+        #     print("Encoder output keys:", x.keys())
+        #     for key, value in x.items():
+        #         print(key, value.shape)
+
+        # elif isinstance(x, (tuple, list)):
+        #     for i, value in enumerate(x):
+        #         print(i, value.shape)
+
+        # else:
+        #     print(x.shape)
+
+        # print(representation)
+        print("outputs processed")
+
+
+        encoder = keras.models.Model(
+            inputs=inputs,
+            outputs=[output1, output2, representation]
+        )
+        
+        reps = keras.layers.Input(
+            shape=(z_m_size + z_s_size,),
+            dtype=tf.float32
+        )
+        # x1 is element of R^(1000 x 256) 
+        # Original decoder
+        base_decoder = decoder
+
+        # Input: concatenated latent representations
+        reps = keras.layers.Input(
+            shape=(z_m_size + z_s_size,),
+            dtype=tf.float32
+        )
+
+        # Fusion projection
         x1 = keras.layers.Dense(256, name='fusion')(reps)
-        reconst = decoder(x1)
-        decoder = tf.keras.models.Model(inputs=(reps), outputs=reconst[0])
-        # Randomize decoder weights if the decoder is pretrained 
-        for layer in decoder.layers:
-            if hasattr(layer, 'kernel_initializer') and hasattr(layer, 'kernel'):
-                layer.kernel.assign(layer.kernel_initializer(layer.kernel.shape))
-            if hasattr(layer, 'bias_initializer') and hasattr(layer, 'bias'):
-                layer.bias.assign(layer.bias_initializer(layer.bias.shape))
-        for layer in decoder.layers:
-            layer.trainable = True
+
+        # Reconstruction
+        reconst = base_decoder(x1)
+
+        # Complete decoder model
+        decoder = keras.models.Model(
+            inputs=reps,
+            outputs=reconst
+        )
+
+        # Randomize decoder weights
+        # for layer in decoder.layers:
+        #     if hasattr(layer, 'kernel_initializer') and hasattr(layer, 'kernel'):
+        #         layer.kernel.assign(
+        #             layer.kernel_initializer(layer.kernel.shape)
+        #         )
+
+        #     if hasattr(layer, 'bias_initializer') and hasattr(layer, 'bias'):
+        #         layer.bias.assign(
+        #             layer.bias_initializer(layer.bias.shape)
+        #         )
+
         return encoder, decoder
 
     def load_from_checkpoint(self):
@@ -207,18 +298,44 @@ class DeMuReFusion():
         for epoch in range(n_epochs):
             batch_ind = 0
             epoch_loss = []
-            for data,_ in trainloader:
+            for data in trainloader:
+                print("\n========== DATA DEBUG ==========")
+                print("Data type:", type(data))
+
+                if isinstance(data, dict):
+                    print("Keys:", data.keys())
+
+                    for mod, value in data.items():
+                        print(f"\nModality: {mod}")
+                        print("Type:", type(value))
+
+                        if isinstance(value, dict):
+                            for key, tensor in value.items():
+                                print(f"  {key}: shape={tensor.shape}, dtype={tensor.dtype}")
+                        else:
+                            print("Shape:", value.shape)
+                            print("Dtype:", value.dtype)
+
+                else:
+                    print("Data:", data)
+
+
                 batch_loss = 0
                 for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
                     with tf.GradientTape() as tape:
                         loss = 0
                         trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
-                        x_m = tf.convert_to_tensor(data[mod])
+                        x_m = convert_modality_input(data, mod)
                         batch_size = x_m.shape[0]
                         noise_m = tf.random.normal(shape=(batch_size ,self.z_sizes[mod]), mean=0.0, stddev=0.1)
                         noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
                         prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
-                        _, z_s_other, _ = self.encoders[prev_modality](tf.convert_to_tensor(data[prev_modality]))
+                        
+                        prev_input = convert_modality_input(data, prev_modality)
+
+                        _, z_s_other, _ = self.encoders[prev_modality](prev_input)
+
+                        #_, z_s_other, _ = self.encoders[prev_modality](tf.convert_to_tensor(data[prev_modality]))
                         z_s_other = z_s_other+noise_s
                         z_m = z[batch_ind:batch_ind+batch_size]+noise_m
                         mse = self.posterior_means[mod][batch_ind:batch_ind+batch_size]**2
@@ -245,6 +362,83 @@ class DeMuReFusion():
                 self.decoders[mod].save_weights(os.path.join(self.ckpt_path,"%s_decoder.weights.h5"%(mod)))
                 np.save(os.path.join(self.ckpt_path,"modality_z_%s"%mod), zm.numpy())
         return loss_trend
+
+
+    def optimize_modality_latent_embedding(self, trainloader, lr, n_epochs, optimizers):
+            loss_fn = tf.keras.losses.MeanSquaredError()
+            loss_trend = []  
+            if self.mask:
+                for modality_name in self.modality_names:
+                    self.modality_masks[modality_name].trainable = False
+                self.shared_mask.trainable = True
+            
+            for epoch in range(n_epochs):
+                batch_ind = 0
+                epoch_loss = []
+                for data in trainloader:
+                    print("\n========== DATA DEBUG ==========")
+                    print("Data type:", type(data))
+    
+                    if isinstance(data, dict):
+                        print("Keys:", data.keys())
+    
+                        for mod, value in data.items():
+                            print(f"\nModality: {mod}")
+                            print("Type:", type(value))
+    
+                            if isinstance(value, dict):
+                                for key, tensor in value.items():
+                                    print(f"  {key}: shape={tensor.shape}, dtype={tensor.dtype}")
+                            else:
+                                print("Shape:", value.shape)
+                                print("Dtype:", value.dtype)
+    
+                    else:
+                        print("Data:", data)
+    
+    
+                    batch_loss = 0
+                    for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
+                        with tf.GradientTape() as tape:
+                            loss = 0
+                            trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
+                            x_m = convert_modality_input(data, mod)
+                            batch_size = x_m.shape[0]
+                            noise_m = tf.random.normal(shape=(batch_size ,self.z_sizes[mod]), mean=0.0, stddev=0.1)
+                            noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
+                            prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
+                            
+                            prev_input = convert_modality_input(data, prev_modality)
+    
+                            _, z_s_other, _ = self.encoders[prev_modality](prev_input)
+    
+                            #_, z_s_other, _ = self.encoders[prev_modality](tf.convert_to_tensor(data[prev_modality]))
+                            z_s_other = z_s_other+noise_s
+                            z_m = z[batch_ind:batch_ind+batch_size]+noise_m
+                            mse = self.posterior_means[mod][batch_ind:batch_ind+batch_size]**2
+                            if self.mask:
+                                loss += (0.1*self.beta*(self.shared_mask.l1())+self.gamma*(self.shared_mask.entropy_regularization())) 
+                                z_s_other = self.shared_mask(z_s_other)
+                                z_m = self.modality_masks[mod](z_m)
+                            reconst = self.decoders[mod](tf.concat([z_m, z_s_other], -1))
+                            loss += loss_fn(x_m, reconst)
+                            loss += 0.01*tf.reduce_mean(mse)
+                            trainable_var.extend([self.posterior_means[mod]])
+                            trainable_var.extend(self.decoders[mod].trainable_variables)
+                        gradients = tape.gradient(loss, trainable_var)
+                        optimizers[m_ind].apply_gradients(zip(gradients, trainable_var))
+                        batch_loss += loss.numpy()
+                        del tape
+                    batch_ind += batch_size     
+                    epoch_loss.append(batch_loss) 
+                loss_trend.append(np.mean(epoch_loss))      
+            if not np.isnan(loss.numpy()):
+                np.save(os.path.join(self.ckpt_path,'shared_mask'), self.shared_mask.mask_logits.numpy())
+                np.save(os.path.join(self.ckpt_path,'shared_mask_bin'), self.shared_mask.binary_mask.numpy())
+                for mod, zm in self.posterior_means.items():
+                    self.decoders[mod].save_weights(os.path.join(self.ckpt_path,"%s_decoder.weights.h5"%(mod)))
+                    np.save(os.path.join(self.ckpt_path,"modality_z_%s"%mod), zm.numpy())
+            return loss_trend
     
     def optimize_shared_latent(self, trainloader, lr, n_epochs, optimizers):
         loss_fn = tf.keras.losses.MeanSquaredError()
@@ -679,3 +873,49 @@ class LearnableMask(keras.layers.Layer):
 
 
 
+
+
+def create_encoder_inputs(encoder, input_size) -> keras.Input:
+
+        # Multiple inputs, e.g. BERT
+        if isinstance(input_size, dict):
+
+            # Map existing encoder inputs to their names
+            encoder_inputs = {
+                tensor.name.split(":")[0].split("/")[-1]: tensor
+                for tensor in encoder.inputs
+            }
+
+            inputs = {}
+
+            for name, shape in input_size.items():
+
+                dtype = encoder_inputs[name].dtype
+
+                inputs[name] = keras.Input(
+                    shape=tuple(shape),
+                    dtype=dtype,
+                    name=name
+                )
+
+            return inputs
+
+        # Single input, e.g. DINOv2
+        else:
+            return keras.Input(
+                shape=tuple(input_size),
+                dtype=encoder.inputs[0].dtype
+            )
+
+
+
+def convert_modality_input(data, modality):
+    x = data[modality]
+
+    if isinstance(x, dict):
+        return {
+            key: tf.convert_to_tensor(value)
+            for key, value in x.items()
+        }
+
+    return tf.convert_to_tensor(x)

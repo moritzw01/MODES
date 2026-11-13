@@ -24,8 +24,20 @@ tf.config.list_physical_devices('GPU')
 
 import keras_hub
 
-from models import BERTDecoder, DINOv2Decoder
-from data import Multimodal3DIdent
+from models import (BERTDecoder,
+                    DINOv2Decoder,
+                    dino_cls,
+                    dino_mean,
+                    bert_cls,
+                    bert_pooled,
+                    BertMeanPoolingAdapter,
+                    BertPooledAdapter,
+                    CLSAdapter,
+                    MeanPoolingAdapter,
+                    BERTEmbeddingDecoder,
+                    DINOv2EmbeddingDecoder
+)
+from data import Multimodal3DIdent, Modality, DeMuReFusionConfig
 
 parser = argparse.ArgumentParser(description='DeMuRe Fusion')
 parser.add_argument('--log_path', default='/home/apxye/multimodal/ID3/logs/out.txt')
@@ -38,7 +50,7 @@ parser.add_argument('--beta', default=1e-6)
 parser.add_argument('--gamma', default=1)
 parser.add_argument('--n_samples', default=1000, type=int)
 parser.add_argument('--n_epochs', default=10, type=int)
-parser.add_argument('--modality_names', nargs='+', default=['img', 'txt'])
+parser.add_argument('--modality_names', nargs='+', default=['M1', 'M2'])
 
 
 def main():
@@ -65,11 +77,9 @@ def main():
         "dinov2_base",
         "bert_small_en_uncased"
     )
-    # img_dim = encoder_1.output_shape[-1]
-    # text_dim = encoder_2.output_shape[0][-1]
-    # print(img_dim, text_dim)
+    
     print("load decoder")
-    decoder_1, decoder_2 = DINOv2Decoder(), BERTDecoder()
+    decoder_1, decoder_2 = DINOv2EmbeddingDecoder(), BERTEmbeddingDecoder()
 
     # Load data
     print("load data")
@@ -78,22 +88,52 @@ def main():
     train_path = data_dir / "train"
     val_path = data_dir / "val"
     test_path = data_dir / "test"
-    trainset = Multimodal3DIdent(data_dir, mode="train")
-    valset = Multimodal3DIdent(data_dir, mode="val")
-    testset = Multimodal3DIdent(data_dir, mode="test")
-    train_loader = DataLoader(trainset, batch_size=64, shuffle=False, drop_last=False)
-    valid_loader = DataLoader(valset, batch_size=64, shuffle=False, drop_last=False)
-    test_loader = DataLoader(testset, batch_size=64, shuffle=False, drop_last=False)
-    
+    trainset = Multimodal3DIdent(data_dir, mode="train", modality_names= (M1, M2))
+    valset = Multimodal3DIdent(data_dir, mode="val", modality_names= (M1, M2))
+    testset = Multimodal3DIdent(data_dir, mode="test", modality_names= (M1, M2))
+    train_loader = DataLoader(trainset, batch_size=64, shuffle=False, drop_last=False, collate_fn=collate_multimodal_fn)
+    #valid_loader = DataLoader(valset, batch_size=64, shuffle=False, drop_last=False, collate_fn=collate_multimodal_fn)
+    #test_loader = DataLoader(testset, batch_size=64, shuffle=False, drop_last=False, collate_fn=collate_multimodal_fn)
+    input_dims = get_dataloader_input_size(train_loader)
     # Train the dissentangler 
-    rep_disentangler = DeMuReFusion(encoders={M1: encoder_1, M2:encoder_2}, 
-                                 decoders={M1: decoder_1, M2:decoder_2}, 
-                                 num_train_samples=len(trainset), shared_size=args.zs_size, modality_names=args.modality_names, 
-                                 z_sizes={M1:args.zm_size, M2:args.zm_size},
-                                 modality_shapes={M1: (img_dim, ), M2: (text_dim, )},
-                                 mask=True, beta=args.beta, gamma=args.gamma, ckpt_path=args.ckpt_path)  
-    del decoder_1, encoder_1, encoder_2, decoder_2
+    m1 = Modality(
+        name="image",
+        encoder=encoder_1,
+        decoder=decoder_1,
+        zm_size=args.zm_size,
+        input_shape=input_dims["image"],
+        representation_fn=dino_cls
+    )
 
+    m2 = Modality(
+        name="text",
+        encoder=encoder_2,
+        decoder=decoder_2,
+        zm_size=args.zm_size,
+        input_shape=input_dims["text"],
+        representation_fn=bert_pooled
+    )
+    fusion_config = DeMuReFusionConfig(
+    modalities = {
+        m1.name.value: m1,
+        m2.name.value: m2
+    },
+    shared_size=args.zs_size,
+    num_train_samples=len(trainset),
+    )
+    rep_disentangler = DeMuReFusion(encoders=fusion_config.encoders, 
+                                 decoders=fusion_config.decoders, 
+                                 num_train_samples=fusion_config.num_train_samples,
+                                 shared_size=fusion_config.shared_size,
+                                 modality_names=fusion_config.modality_names, 
+                                 z_sizes=fusion_config.z_sizes,
+                                 modality_shapes=fusion_config.modality_shapes,
+                                 mask=True,
+                                 beta=args.beta,
+                                 gamma=args.gamma,
+                                 ckpt_path=args.ckpt_path,
+                                 representation_fns=fusion_config.representation_fns,)  
+    del decoder_1, encoder_1, encoder_2, decoder_2
 
     dec_loss, enc_loss, shared_loss, modality_loss = rep_disentangler.train(train_loader, epochs_enc=args.n_epochs, epochs_dec=args.n_epochs, 
                                                                             lr_dec=1e-3, lr_enc=1e-3, iteration_count=20,

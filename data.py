@@ -9,7 +9,9 @@ import torch
 from collections import Counter, OrderedDict
 from nltk.tokenize import sent_tokenize, word_tokenize
 from torchvision.datasets.folder import pil_loader
+from torchvision import transforms
 from torch.utils.data import Dataset 
+import keras
 
 class OrderedCounter(Counter, OrderedDict):
     """Counter that remembers the order of elements encountered."""
@@ -70,7 +72,7 @@ class Multimodal3DIdent(Dataset):
         }
     }
 
-    def __init__(self, data_dir, mode=None, transform=None,
+    def __init__(self, data_dir, modality_names, mode=None, transform=None,
                  has_labels=True, vocab_filepath=None):
         """
         Args:
@@ -81,6 +83,7 @@ class Multimodal3DIdent(Dataset):
             vocab_filepath (str): Optional path to a saved vocabulary. If None,
               the vocabulary will be (re-)created.
         """
+        self.mod_names = modality_names
         self.mode = mode
         self.transform = transform
         self.has_labels = has_labels
@@ -126,6 +129,13 @@ class Multimodal3DIdent(Dataset):
             fp = os.path.join(self.image_dir, str(i).zfill(width) + ".png")
             image_paths.append(fp)
         self.image_paths = image_paths
+
+        # transforms for dinoV2 
+        self.transform = transforms.Compose([
+                    transforms.Resize((518, 518)),
+                    transforms.ToTensor(),
+                    transforms.Lambda(lambda x: x.permute(1, 2, 0))
+                ])
 
     def get_w2i(self, word):
         try:
@@ -213,53 +223,92 @@ class Multimodal3DIdent(Dataset):
         return (vocab["w2i"], vocab["i2w"])
 
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-
         # load image
         img_name = self.image_paths[idx]
         image = pil_loader(img_name)
         if self.transform is not None:
             image = self.transform(image)
 
-        image_mod = ImageModality(image, img_name)
-        # load text
-        words = self.text_in_words[idx]
-        words = words + ["{eos}"]
-        words = words + ["{pad}" for c in range(self.max_sequence_length-len(words))]
-        indices = [self.get_w2i(word) for word in words]
-        indices_onehot = torch.nn.functional.one_hot(
-            torch.Tensor(indices).long(), self.vocab_size).float()
 
-        text_mod = TextModality(indices, indices_onehot, words)
-        # load labels
+        image_mod = ModalityData(
+        data=image,
+        name="image",
+        metadata={"image_name": img_name}
+    )
+        # Load text
+        words = self.text_in_words[idx]
+
+        words = words + ["{eos}"]
+        words = words[:self.max_sequence_length]
+
+        words = words + [
+            "{pad}" for _ in range(
+                self.max_sequence_length - len(words)
+            )
+        ]
+
+        token_ids = torch.tensor(
+            [self.get_w2i(w) for w in words],
+            dtype=torch.long
+        )
+
+        # BERT inputs
+        padding_mask = (token_ids != self.get_w2i("{pad}")).long()
+
+        segment_ids = torch.zeros_like(token_ids)
+
+        text_mod = ModalityData(
+            data={
+                "token_ids": token_ids,
+                "segment_ids": segment_ids,
+                "padding_mask": padding_mask
+            },
+            name="text",
+            metadata={"words": words}
+        )
+
+        # Load labels
         if self.has_labels:
-            z_image = {k: v[idx] for k, v in self.labels["z_image"].items()}
-            z_text = {k: v[idx] for k, v in self.labels["z_text"].items()}
-        else:
-            z_image, z_text = None, None
+            image_mod.z = {
+                k: v[idx]
+                for k, v in self.labels["z_image"].items()
+            }
+
+            text_mod.z = {
+                k: v[idx]
+                for k, v in self.labels["z_text"].items()
+            }
 
         sample = MultiModalSample(
-            image_mod, 
-            text_mod,
-            z_image,
-            z_text
-        )
+        idx=idx,
+        modalities={
+            "image": image_mod,
+            "text": text_mod
+        }
+    )
+
         return sample
 
     def __len__(self):
         return self.num_samples
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, Any
 import torch
 import numpy as np
 
+class ModalityType(Enum):
+    IMAGE = "image"
+    TEXT = "text"
+
+
 @dataclass
 class ImageModality:
-    data: torch.Tensor
-    name: str
-    
+    data: torch.Tensor # image data 
+    image_name: str
+    z_image: dict | None = None
     @property
     def shape(self):
         return self.data.shape
@@ -267,25 +316,96 @@ class ImageModality:
 @dataclass
 class TextModality:
     indices: torch.Tensor
-    one_hot: torch.Tensor
+    data: torch.Tensor # one-hot coding 
     words: list[str]
+    z_text: dict | None = None
     
     @property
     def shape(self):
-        return self.one_hot.shape
+        return self.data.shape
+
+
+@dataclass
+class ModalityData:
+    data: torch.Tensor | dict[str, torch.Tensor]
+    name: str
+    metadata: dict | None = None
+    z: dict | None = None
+
+    @property
+    def shape(self):
+        if isinstance(self.data, dict):
+            return {
+                key: value.shape
+                for key, value in self.data.items()
+            }
+        return self.data.shape
+
 
 @dataclass
 class MultiModalSample:
-    image: ImageModality
-    text: TextModality
-    z_image: dict | None = None
-    z_text: dict | None = None
-    id: int 
+    idx: int
+    modalities: dict[str, ModalityData]
+
+    @property
+    def mod_names(self):
+        return list(self.modalities.keys())
 
 
+@dataclass
+class Modality:
+    name: ModalityType  # Kann als Enum oder String übergeben werden
+    encoder: keras.Model
+    decoder: keras.Model
+    zm_size: int
+    input_shape: dict | tuple
+    representation_fn: callable = None
+
+    def __post_init__(self):
+        if not isinstance(self.name, ModalityType):
+            try:
+                self.name = ModalityType(self.name)
+            except ValueError:
+                valid_names = [e.value for e in ModalityType]
+                raise ValueError(
+                    f"name: '{self.name}'. "
+                    f"valid names: {valid_names}"
+                )
 
 
+@dataclass
+class DeMuReFusionConfig:
+    modalities: Dict[str, Modality] = field(default_factory=dict)
+    shared_size: int = 128
+    num_train_samples: int = 0
+    
+    @property
+    def modality_names(self) -> list[str]:
+        return list(self.modalities.keys())
+    
+    @property
+    def encoders(self) -> dict[str, torch.nn.Module]:
+        return {name: mod.encoder for name, mod in self.modalities.items()}
+    
+    @property
+    def decoders(self) -> dict[str, torch.nn.Module]:
+        return {name: mod.decoder for name, mod in self.modalities.items()}
+    
+    @property
+    def z_sizes(self) -> dict[str, int]:
+        return {name: mod.zm_size for name, mod in self.modalities.items()}
+    
+    @property
+    def modality_shapes(self) -> dict[str, tuple]:
+        return {name: mod.input_shape for name, mod in self.modalities.items()}
 
+    @property
+    def representation_fns(self):
+        return {
+            name: modality.representation_fn
+            for name, modality in self.modalities.items()
+        }
+    
 
 class MultimodalUKBDataset(Dataset):
     def __init__(self, paths, file_names):

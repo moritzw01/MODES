@@ -12,7 +12,6 @@ dependencies = [
     "nltk>=3.10.4",
     "numpy>=2.1.0",
     "pandas>=2.3.3",
-    "pydantic>=2.14.3",
     "scikit-learn>=1.9.1",
     "seaborn>=0.13.2",
     "tensorflow==2.19.0",

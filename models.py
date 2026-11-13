@@ -1,6 +1,6 @@
 
 import keras
-
+import tensorflow as tf
 
 class DINOv2Decoder(keras.Model):
 
@@ -57,6 +57,20 @@ class DINOv2Decoder(keras.Model):
         return self.decoder(z, training=training)
 
 
+class DINOv2EmbeddingDecoder(keras.Model):
+    def __init__(self, latent_dim=256, output_dim=768, **kwargs):
+        super().__init__(**kwargs)
+
+        self.decoder = keras.Sequential([
+            keras.Input(shape=(latent_dim,)),
+            keras.layers.Dense(512, activation="gelu"),
+            keras.layers.LayerNormalization(),
+            keras.layers.Dense(output_dim)
+        ])
+
+    def call(self, z, training=False):
+        return self.decoder(z, training=training)
+
 
 class BERTDecoder(keras.Model):
 
@@ -93,3 +107,66 @@ class BERTDecoder(keras.Model):
 
     def call(self, z, training=False):
         return self.decoder(z, training=training)
+
+
+class BERTEmbeddingDecoder(keras.Model):
+    def __init__(self, latent_dim=256, output_dim=512, **kwargs):
+        super().__init__(**kwargs)
+
+        self.decoder = keras.Sequential([
+            keras.Input(shape=(latent_dim,)),
+            keras.layers.Dense(512, activation="gelu"),
+            keras.layers.LayerNormalization(),
+            keras.layers.Dense(output_dim)
+        ])
+
+    def call(self, z, training=False):
+        return self.decoder(z, training=training)
+
+
+class RepresentationAdapter(keras.layers.Layer):
+
+    def call(self, inputs):
+        raise NotImplementedError
+
+class CLSAdapter(RepresentationAdapter):
+
+    def call(self, inputs):
+        return inputs[:, 0, :]
+
+
+class MeanPoolingAdapter(RepresentationAdapter):
+
+    def call(self, inputs):
+        return tf.reduce_mean(inputs[:, 1:, :], axis=1)
+
+
+class BertPooledAdapter(RepresentationAdapter):
+
+    def call(self, inputs):
+        return inputs["pooled_output"]
+
+
+class BertMeanPoolingAdapter(RepresentationAdapter):
+
+    def call(self, inputs):
+        sequence = inputs["sequence_output"]
+        mask = tf.cast(inputs["padding_mask"], sequence.dtype)
+        mask = tf.expand_dims(mask, axis=-1)
+
+        return tf.reduce_sum(sequence * mask, axis=1) / (
+            tf.reduce_sum(mask, axis=1) + 1e-9
+        )
+
+# extracts the correct representation from the encoder 
+def dino_cls(x):
+    return x[:, 0, :]
+
+def dino_mean(x):
+    return tf.reduce_mean(x[:, 1:, :], axis=1)
+
+def bert_cls(x):
+    return x["sequence_output"][:, 0, :]
+
+def bert_pooled(x):
+    return x["pooled_output"]

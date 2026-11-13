@@ -28,23 +28,55 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from data import Multimodal3DIdent, MultimodalUKBDataset, MultiModalSample, TextModality, ImageModality
+from data import Multimodal3DIdent, MultimodalUKBDataset, MultiModalSample
 
 import numpy as np
+
+
+def collate_multimodal_fn(batch):
+
+    collated_data = {}
+
+    for mod in batch[0].mod_names:
+
+        modality_data = batch[0].modalities[mod].data
+
+        if isinstance(modality_data, dict):
+            collated_data[mod] = {
+                key: torch.stack([
+                    item.modalities[mod].data[key]
+                    for item in batch
+                ])
+                for key in modality_data
+            }
+
+        else:
+            collated_data[mod] = torch.stack([
+                item.modalities[mod].data
+                for item in batch
+            ])
+
+    return collated_data
+
 def get_dataloader_input_size(dataloader: DataLoader):
     """
-    Holt sich einen Batch aus dem DataLoader und gibt die Shape 
-    (bzw. Input-Size) des ersten Elements (der Eingabedaten) zurück.
+    Returns the input shape of each modality in the first batch.
     """
-    # Iterator über den DataLoader erstellen und den ersten Batch holen
     batch = next(iter(dataloader))
 
-    if isinstance(batch, (list, tuple, np.ndarray)): 
-        return batch[0].shape
-    elif isinstance(batch,  MultiModalSample): 
-        image_mod = batch.image
-        text_mod = batch.text
-        return image_mod.data.shape, text_mod.one_hot.shape 
+    input_dims = {}
+    for mod, data in batch.items():
+
+        if isinstance(data, dict):
+            input_dims[mod] = {
+                key: tensor.shape[1:]
+                for key, tensor in data.items()
+            }
+
+        else:
+            input_dims[mod] = data.shape[1:]
+
+    return input_dims
 
 def print_sample_shapes(item, prefix=""):
     """
