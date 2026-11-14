@@ -37,6 +37,12 @@ def collate_multimodal_fn(batch):
 
     collated_data = {}
 
+    collated_data["id"] = torch.tensor(
+        [item.idx for item in batch],
+        dtype=torch.long
+    )
+
+
     for mod in batch[0].mod_names:
 
         modality_data = batch[0].modalities[mod].data
