@@ -322,11 +322,11 @@ class DeMuReFusion():
             for data,_ in trainloader:
                 batch_loss = 0
                 for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
-                    
+                    target_representation = self.generate_target_representation(data, mod)
                     with tf.GradientTape() as tape:
                         trainable_var = [self.shared_post_mean]
 
-                        target_representation = self.generate_target_representation(data, mod)
+                        #target_representation = self.generate_target_representation(data, mod)
 
                         batch_size = target_representation.shape[0]
                         mse = self.shared_post_mean[batch_ind:batch_ind+batch_size]**2           
