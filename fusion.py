@@ -102,21 +102,7 @@ class DeMuReFusion():
 
         output1 = keras.layers.Dense(z_m_size, name='modality')(representation)
         output2 = keras.layers.Dense(z_s_size, name='shared')(representation)
-        # print("Encoder output type:", type(x))
 
-        # if isinstance(x, dict):
-        #     print("Encoder output keys:", x.keys())
-        #     for key, value in x.items():
-        #         print(key, value.shape)
-
-        # elif isinstance(x, (tuple, list)):
-        #     for i, value in enumerate(x):
-        #         print(i, value.shape)
-
-        # else:
-        #     print(x.shape)
-
-        # print(representation)
         print("outputs processed")
 
 
@@ -125,10 +111,6 @@ class DeMuReFusion():
             outputs=[output1, output2, representation]
         )
         
-        reps = keras.layers.Input(
-            shape=(z_m_size + z_s_size,),
-            dtype=tf.float32
-        )
         # x1 is element of R^(1000 x 256) 
         # Original decoder
         base_decoder = decoder
@@ -197,6 +179,11 @@ class DeMuReFusion():
         optimizer_4 = tf.keras.optimizers.Adam(learning_rate=lr_dec, clipvalue=1)
         optimizer_encoder_1 = tf.keras.optimizers.Adam(learning_rate=lr_enc, clipvalue=1)
         optimizer_encoder_2 = tf.keras.optimizers.Adam(learning_rate=lr_enc, clipvalue=1)
+
+
+
+        for mod, enc in self.encoders.items():
+            print(mod, sum(int(np.prod(v.shape)) for v in enc.trainable_variables))
 
         # Run the first round without the masking
         if no_mask_epochs is not None and self.mask is True:
@@ -269,11 +256,16 @@ class DeMuReFusion():
                 for data in trainloader:
                     batch_loss = 0
                     for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
+                        target_representation = self.generate_target_representation(data, mod)
+                        prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
+                        prev_input = convert_modality_input(data, prev_modality)
+                        _, z_s_other, _ = self.encoders[prev_modality](prev_input, training=False)
+                        
                         with tf.GradientTape() as tape:
                             loss = 0
                             trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
                             
-                            target_representation = self.generate_target_representation(data, mod)
+                            #target_representation = self.generate_target_representation(data, mod)
                             
                             # noise regularisation 
 
@@ -282,11 +274,11 @@ class DeMuReFusion():
                             noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
 
                             
-                            prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
+                            #prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
                             
-                            prev_input = convert_modality_input(data, prev_modality)
+                            #prev_input = convert_modality_input(data, prev_modality)
     
-                            _, z_s_other, _ = self.encoders[prev_modality](prev_input)
+                            #_, z_s_other, _ = self.encoders[prev_modality](prev_input)
 
                             z_s_other = z_s_other+noise_s
                             z_m = z[batch_ind:batch_ind+batch_size]+noise_m
@@ -330,6 +322,7 @@ class DeMuReFusion():
             for data,_ in trainloader:
                 batch_loss = 0
                 for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
+                    
                     with tf.GradientTape() as tape:
                         trainable_var = [self.shared_post_mean]
 
@@ -525,8 +518,6 @@ class DeMuReFusion():
         return target_representation
 
 
-    def get_cached_embedding(self, data, modality):
-        if 
 class DeMuReFusionMI(DeMuReFusion): 
     """
     implements a Mutual Information Loss function for the recreation error 
