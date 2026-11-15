@@ -215,6 +215,18 @@ class DeMuReFusion():
                     m1_mask= np.stack(modality_specific_masks[self.modality_names[0]]),
                     m2_mask= np.stack(modality_specific_masks[self.modality_names[1]]))
 
+            checkpoint = tf.train.Checkpoint(
+                encoders=self.encoders,
+                decoders=self.decoders,
+                shared_post_mean=self.shared_post_mean,
+                posterior_means=self.posterior_means,
+                shared_mask=self.shared_mask,
+                modality_masks=self.modality_masks
+            )
+
+            checkpoint.write(str(self.ckpt_path / f"fusion_checkpoint_iter{iter_round}"))
+            
+
         if extra_encoder_training is not None:
             enc_loss.extend(self.train_encoder(trainloader, lr_enc, extra_encoder_training, [optimizer_encoder_1, optimizer_encoder_2]))
             np.savez(os.path.join(self.ckpt_path,'train_tracker.npz'), modality_loss=m_loss, shared_loss=shared_loss, 
@@ -319,7 +331,7 @@ class DeMuReFusion():
         for epoch in range(n_epochs):
             batch_ind = 0
             epoch_loss = []
-            for data,_ in trainloader:
+            for data in trainloader:
                 batch_loss = 0
                 for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
                     target_representation = self.generate_target_representation(data, mod)
@@ -362,11 +374,12 @@ class DeMuReFusion():
     
     def train_encoder(self, trainloader, lr, n_epochs, optimizers):
         loss_trend = []
+        
         self._set_trainable_mask(trainable=False)
         for epoch in range(n_epochs):
             batch_ind = 0
             epoch_loss = []
-            for data,_ in trainloader:
+            for data in trainloader:
                 batch_loss = 0
                 for m_ind, (mod, encoder) in  enumerate(self.encoders.items()):
                     with tf.GradientTape() as tape:
@@ -517,7 +530,31 @@ class DeMuReFusion():
 
         return target_representation
 
+    def get_encoder_outputs(self, dataloader):
+        outputs = {
+            mod: {}
+            for mod in self.modality_names
+        }
 
+        for data, idx in dataloader:
+            for mod, encoder in self.encoders.items():
+                x_m = convert_modality_input(data, mod)
+                z_m, z_s, _ = encoder(x_m, training=False)
+
+                z_m = z_m.numpy()
+                z_s = z_s.numpy()
+                indices = idx.numpy()
+
+                for i, sample_idx in enumerate(indices):
+                    outputs[mod][int(sample_idx)] = {
+                        "shared": z_s[i],
+                        "specific": z_m[i]
+                    }
+
+        return outputs
+
+
+    
 class DeMuReFusionMI(DeMuReFusion): 
     """
     implements a Mutual Information Loss function for the recreation error 
