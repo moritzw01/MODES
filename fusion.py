@@ -10,6 +10,9 @@ import tensorflow_probability as tfp
 from tensorflow_probability.python.distributions import logistic
 
 from mi_estimators import *
+import time
+from pathlib import Path
+from models import CachedEncoder
 
 class DeMuReFusion():
     """
@@ -34,7 +37,7 @@ class DeMuReFusion():
         beta (float): A hyperparameter for l1 regularization of the masks.
     """
     def __init__(self, encoders, decoders, num_train_samples, z_sizes, shared_size,
-                 modality_names, modality_shapes, ckpt_path, gamma=1, mask=False, beta=1, representation_fns=None):
+                 modality_names, modality_shapes, ckpt_path, gamma=1, mask=False, beta:int=1, representation_fns=None):
         
         super(DeMuReFusion, self).__init__()
         self.mask = mask
@@ -44,12 +47,10 @@ class DeMuReFusion():
         self.n_modalitites = len(modality_names)
         self.modality_names = modality_names
         self.modality_shapes = modality_shapes
-        self.beta = beta
-        self.gamma = gamma
-        self.ckpt_path = ckpt_path
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        self.ckpt_path = Path(ckpt_path)
         self.representation_fns = representation_fns or {}
-        self.modality_dict = {mod: {} for mod in modality_names}
-
         # Initialize latent representations
         self.posterior_means = {}
         for mod, z_size in z_sizes.items():
@@ -65,12 +66,16 @@ class DeMuReFusion():
         # Initialize pretrained models
         self.encoders, self.decoders = {}, {}
         for model_name in modality_names:
-            encoder, decoder = self._add_disentangled_block(encoders[model_name], decoders[model_name], 
+            encoder, decoder = self._add_disentangled_heads(encoders[model_name], decoders[model_name], 
                                                             modality_shapes[model_name], z_s_size=shared_size, 
                                                             z_m_size=z_sizes[model_name],
                                                             representation_fn=representation_fns[model_name],trainable=True)
             self.encoders[model_name] = encoder
             self.decoders[model_name] = decoder
+
+        self.raw_encoder_outputs = {mod: {} for mod,_ in self.encoders.items()}
+
+
 
 
     def _set_trainable_mask(self, trainable):
@@ -102,7 +107,21 @@ class DeMuReFusion():
 
         output1 = keras.layers.Dense(z_m_size, name='modality')(representation)
         output2 = keras.layers.Dense(z_s_size, name='shared')(representation)
+        # print("Encoder output type:", type(x))
 
+        # if isinstance(x, dict):
+        #     print("Encoder output keys:", x.keys())
+        #     for key, value in x.items():
+        #         print(key, value.shape)
+
+        # elif isinstance(x, (tuple, list)):
+        #     for i, value in enumerate(x):
+        #         print(i, value.shape)
+
+        # else:
+        #     print(x.shape)
+
+        # print(representation)
         print("outputs processed")
 
 
@@ -147,21 +166,79 @@ class DeMuReFusion():
 
         return encoder, decoder
 
+    def _add_disentangled_heads(
+            self,
+            encoder: keras.models.Model,
+            decoder: keras.models.Model,
+            input_size,
+            z_s_size,
+            z_m_size,
+            representation_fn,
+            trainable=False
+            ):
+        for layer in encoder.layers:
+            layer.trainable = False
+
+        # 1. Eingefrorenes Backbone (Input -> representation)
+        inputs = create_encoder_inputs(encoder, input_size)
+        x = encoder(inputs, training=False)
+        representation = representation_fn(x)
+
+        backbone_model = keras.models.Model(
+            inputs=inputs,
+            outputs=representation
+        )
+
+        # 2. Trainierbare Heads (representation -> [output1, output2])
+        rep_input = keras.layers.Input(
+            shape=representation.shape[1:],
+            dtype=tf.float32
+        )
+        output1 = keras.layers.Dense(z_m_size, name='modality')(rep_input)
+        output2 = keras.layers.Dense(z_s_size, name='shared')(rep_input)
+
+        heads_model = keras.models.Model(
+            inputs=rep_input,
+            outputs=[output1, output2]
+        )
+
+        # cached encoder uncouples the heads from the backbone during training and uses caching 
+        # for bigger batch size and faster training with big Transformer models 
+        encoder = CachedEncoder(
+            backbone=backbone_model,
+            heads=heads_model
+        )
+
+        base_decoder = decoder
+        reps = keras.layers.Input(
+            shape=(z_m_size + z_s_size,),
+            dtype=tf.float32
+        )
+        x1 = keras.layers.Dense(256, name='fusion')(reps)
+        reconst = base_decoder(x1)
+
+        decoder = keras.models.Model(
+            inputs=reps,
+            outputs=reconst
+        )
+
+        return encoder, decoder
+
     def load_from_checkpoint(self):
         ckpt_path = self.ckpt_path
         for modal_name in (self.modality_names):
-            self.encoders[modal_name].load_weights(os.path.join(ckpt_path, (modal_name+"_encoder.weights.h5")))
-            self.decoders[modal_name].load_weights(os.path.join(ckpt_path, (modal_name+"_decoder.weights.h5")))
-            self.posterior_means[modal_name] = np.load(os.path.join(ckpt_path, "modality_z_%s.npy"%modal_name))
-            self.modality_masks[modal_name].mask_logits = np.load(os.path.join(ckpt_path, "mask_%s.npy"%modal_name))
-            self.modality_masks[modal_name].binary_mask = np.load(os.path.join(ckpt_path, "mask_%s_bin.npy"%modal_name))
+            self.encoders[modal_name].load_weights(ckpt_path / f"{modal_name}_encoder.weights.h5")
+            self.decoders[modal_name].load_weights(ckpt_path / f"{modal_name}_decoder.weights.h5")
+            self.posterior_means[modal_name] = np.load(ckpt_path / f"modality_z_{modal_name}.npy")
+            self.modality_masks[modal_name].mask_logits = np.load(ckpt_path / f"mask_{modal_name}.npy")
+            self.modality_masks[modal_name].binary_mask = np.load(ckpt_path / f"mask_{modal_name}_bin.npy")
             self.modality_masks[modal_name].temperature = 0.2
             self.modality_masks[modal_name].trainable = False
             print('Percentage of selected features for %s: '%modal_name, tf.math.reduce_sum(self.modality_masks[modal_name].binary_mask)/self.z_sizes[modal_name])
             print(tf.sigmoid(self.modality_masks[modal_name].mask_logits))
-        self.shared_post_mean = np.load(os.path.join(ckpt_path,'shared_z.npy'))
-        self.shared_mask.mask_logits = np.load(os.path.join(ckpt_path,'shared_mask.npy'))
-        self.shared_mask.binary_mask = np.load(os.path.join(ckpt_path,'shared_mask_bin.npy'))
+        self.shared_post_mean = np.load(ckpt_path / "shared_z.npy")
+        self.shared_mask.mask_logits = np.load(ckpt_path / "shared_mask.npy")
+        self.shared_mask.binary_mask = np.load(ckpt_path / "shared_mask_bin.npy")
         self.shared_mask.temperature = 0.2
         self.shared_mask.trainable = False
         self._set_trainable_mask(trainable=False)
@@ -180,16 +257,14 @@ class DeMuReFusion():
         optimizer_encoder_1 = tf.keras.optimizers.Adam(learning_rate=lr_enc, clipvalue=1)
         optimizer_encoder_2 = tf.keras.optimizers.Adam(learning_rate=lr_enc, clipvalue=1)
 
-
-
-        for mod, enc in self.encoders.items():
-            print(mod, sum(int(np.prod(v.shape)) for v in enc.trainable_variables))
-
         # Run the first round without the masking
         if no_mask_epochs is not None and self.mask is True:
             self.mask = False
+            print("modality latent...", flush=True)
             m_loss.extend(self.optimize_modality_latent(trainloader, lr_dec, no_mask_epochs, [optimizer_1,optimizer_2]))
+            print("shared latent...", flush=True)
             shared_loss.extend(self.optimize_shared_latent(trainloader, lr_dec, no_mask_epochs, [optimizer_3,optimizer_4]))
+            print("Encoder...", flush=True)
             enc_loss.extend(self.train_encoder(trainloader, lr_enc, no_mask_epochs, [optimizer_encoder_1, optimizer_encoder_2]))
             optimizer_1 = tf.keras.optimizers.Adam(learning_rate=lr_dec, clipvalue=1)
             optimizer_2 = tf.keras.optimizers.Adam(learning_rate=lr_dec, clipvalue=1)
@@ -198,9 +273,30 @@ class DeMuReFusion():
             self.mask = True
 
         for iter_round in range(iteration_count):
+            start = time.perf_counter()
+            print("Starting modality optimization...", flush=True)
             m_loss.extend(self.optimize_modality_latent(trainloader, lr_dec, epochs_dec, [optimizer_1,optimizer_2]))
+            print(
+                f"Modality optimization: {time.perf_counter() - start:.2f}s",
+                flush=True
+            )
+
+            start = time.perf_counter()
+            print("Starting shared optimization...", flush=True)
             shared_loss.extend(self.optimize_shared_latent(trainloader, lr_dec, epochs_dec, [optimizer_3,optimizer_4]))
+            print(
+                f"Shared optimization: {time.perf_counter() - start:.2f}s",
+                flush=True
+            )
+            start = time.perf_counter()
+            print("Starting encoder training...", flush=True)
+
             enc_loss.extend(self.train_encoder(trainloader, lr_enc, epochs_enc, [optimizer_encoder_1, optimizer_encoder_2]))
+            print(
+                f"Encoder training: {time.perf_counter() - start:.2f}s",
+                flush=True
+            )
+            
             # Annealing and recording temperature
             for modality_name, z_size in self.z_sizes.items():
                 self._anneal_temperature(modality_name=modality_name, annealing_strategy=temp_annealing, iter_round=iter_round, n_rounds=iteration_count)
@@ -210,7 +306,7 @@ class DeMuReFusion():
             tf.keras.backend.clear_session()
             gc.collect() 
             # Prepare the data as a dictionary or list of lists
-            np.savez(os.path.join(self.ckpt_path,'train_tracker.npz'), modality_loss=m_loss, shared_loss=shared_loss, 
+            np.savez(self.ckpt_path / "train_tracker.npz", modality_loss=m_loss, shared_loss=shared_loss, 
                     encoder_loss=enc_loss, shared_mask=np.stack(shared_mask),
                     m1_mask= np.stack(modality_specific_masks[self.modality_names[0]]),
                     m2_mask= np.stack(modality_specific_masks[self.modality_names[1]]))
@@ -225,11 +321,10 @@ class DeMuReFusion():
             )
 
             checkpoint.write(str(self.ckpt_path / f"fusion_checkpoint_iter{iter_round}"))
-            
 
         if extra_encoder_training is not None:
             enc_loss.extend(self.train_encoder(trainloader, lr_enc, extra_encoder_training, [optimizer_encoder_1, optimizer_encoder_2]))
-            np.savez(os.path.join(self.ckpt_path,'train_tracker.npz'), modality_loss=m_loss, shared_loss=shared_loss, 
+            np.savez(self.ckpt_path / "train_tracker_enc.npz", modality_loss=m_loss, shared_loss=shared_loss, 
                         encoder_loss=enc_loss, shared_mask=np.stack(shared_mask),
                         m1_mask= np.stack(modality_specific_masks[self.modality_names[0]]),
                         m2_mask= np.stack(modality_specific_masks[self.modality_names[1]])) 
@@ -267,12 +362,15 @@ class DeMuReFusion():
                 epoch_loss = []
                 for data in trainloader:
                     batch_loss = 0
+                    batch_ids = data["id"]
                     for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
-                        target_representation = self.generate_target_representation(data, mod)
+                        # calling the encoders with ids for caching 
+                        x_m = convert_modality_input(data, mod)
+                        _, _, target_representation = self.encoders[mod](x_m, idx=batch_ids, training=False)
                         prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
                         prev_input = convert_modality_input(data, prev_modality)
-                        _, z_s_other, _ = self.encoders[prev_modality](prev_input, training=False)
-                        
+                        _, z_s_other, _ = self.encoders[prev_modality](prev_input, idx = batch_ids, training=False)
+                    
                         with tf.GradientTape() as tape:
                             loss = 0
                             trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
@@ -314,11 +412,25 @@ class DeMuReFusion():
                     epoch_loss.append(batch_loss) 
                 loss_trend.append(np.mean(epoch_loss))      
             if not np.isnan(loss.numpy()):
-                np.save(os.path.join(self.ckpt_path,'shared_mask'), self.shared_mask.mask_logits.numpy())
-                np.save(os.path.join(self.ckpt_path,'shared_mask_bin'), self.shared_mask.binary_mask.numpy())
+                np.save(
+                    self.ckpt_path / "shared_mask",
+                    self.shared_mask.mask_logits.numpy()
+                )
+
+                np.save(
+                    self.ckpt_path / "shared_mask_bin",
+                    self.shared_mask.binary_mask.numpy()
+                )
+
                 for mod, zm in self.posterior_means.items():
-                    self.decoders[mod].save_weights(os.path.join(self.ckpt_path,"%s_decoder.weights.h5"%(mod)))
-                    np.save(os.path.join(self.ckpt_path,"modality_z_%s"%mod), zm.numpy())
+                    self.decoders[mod].save_weights(
+                        self.ckpt_path / f"{mod}_decoder.weights.h5"
+                    )
+
+                    np.save(
+                        self.ckpt_path / f"modality_z_{mod}",
+                        zm.numpy()
+                    )
             return loss_trend
     
     def optimize_shared_latent(self, trainloader, lr, n_epochs, optimizers):
@@ -333,8 +445,11 @@ class DeMuReFusion():
             epoch_loss = []
             for data in trainloader:
                 batch_loss = 0
+                batch_ids = data["id"]
                 for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
-                    target_representation = self.generate_target_representation(data, mod)
+                    x_m = convert_modality_input(data, mod)
+
+                    _, _, target_representation = self.encoders[mod](x_m, idx=batch_ids, training=False)
                     with tf.GradientTape() as tape:
                         trainable_var = [self.shared_post_mean]
 
@@ -366,26 +481,46 @@ class DeMuReFusion():
             loss_trend.append(np.mean(epoch_loss))  
         if not np.isnan(loss.numpy()):
             for mod, zm in self.posterior_means.items():
-                self.decoders[mod].save_weights(os.path.join(self.ckpt_path,"/%s_decoder.weights.h5"%(mod)))
-                np.save(os.path.join(self.ckpt_path,'mask_%s'%mod), self.modality_masks[mod].mask_logits.numpy())
-                np.save(os.path.join(self.ckpt_path,'mask_%s_bin'%mod), self.modality_masks[mod].binary_mask.numpy())
-            np.save(os.path.join(self.ckpt_path,"shared_z"), self.shared_post_mean.numpy())
+                self.decoders[mod].save_weights(
+                    self.ckpt_path / f"{mod}_decoder.weights.h5"
+                )
+
+                np.save(
+                    self.ckpt_path / f"mask_{mod}",
+                    self.modality_masks[mod].mask_logits.numpy()
+                )
+
+                np.save(
+                    self.ckpt_path / f"mask_{mod}_bin",
+                    self.modality_masks[mod].binary_mask.numpy()
+                )
+
+            np.save(
+                self.ckpt_path / "shared_z",
+                self.shared_post_mean.numpy()
+            )
         return loss_trend
     
     def train_encoder(self, trainloader, lr, n_epochs, optimizers):
         loss_trend = []
-        
         self._set_trainable_mask(trainable=False)
         for epoch in range(n_epochs):
             batch_ind = 0
             epoch_loss = []
             for data in trainloader:
                 batch_loss = 0
+                batch_ids = data["id"]
                 for m_ind, (mod, encoder) in  enumerate(self.encoders.items()):
+                    x_m = convert_modality_input(data, mod)
+                    
+                    
+                    # caching inside the encoder and getting the representation from the backbone
+                    # to feed it into the heads inside the taped gradient to not store the backbone for backprop 
+                    # results in faster training with higher batchsize  
+                    rep = encoder.get_representation(x_m, idx=batch_ids)
+                    batch_size = rep.shape[0]
                     with tf.GradientTape() as tape:
-                        x_m = convert_modality_input(data, mod)
-                        batch_size = x_m.shape[0]
-                        z_m, z_s, _ = encoder(x_m)
+                        z_m, z_s, _ = encoder(inputs = x_m, representation = rep)
                         shared_mse = (self.shared_post_mean[batch_ind:batch_ind+batch_size] - z_s)**2
                         mod_mse = (self.posterior_means[mod][batch_ind:batch_ind+batch_size]-z_m)**2
                         shared_loss = tf.reduce_sum(self.shared_mask(shared_mse), -1)/tf.reduce_sum(self.shared_mask.binary_mask)
@@ -401,7 +536,7 @@ class DeMuReFusion():
             loss_trend.append(np.mean(epoch_loss))  
         if not np.isnan(loss.numpy()):
             for (mod, encoder) in self.encoders.items():
-                encoder.save_weights(os.path.join(self.ckpt_path,"%s_encoder.weights.h5"%(mod)))
+                encoder.save_weights(self.ckpt_path / f"{mod}_encoder.weights.h5")
         return loss_trend
     
     def merge_representations(self, x_batch):
@@ -516,43 +651,41 @@ class DeMuReFusion():
 
         return frobenius_norm
 
-    def generate_target_representation(self, data, modality):
-
-        x_m = convert_modality_input(data, modality)
-
-        # Generate original embedding
-        _, _, target_representation = self.encoders[modality](
-            x_m, training=False
-        )
-
-        # Prevent gradients through the target
-        target_representation = tf.stop_gradient(target_representation)
-
-        return target_representation
-
     def get_encoder_outputs(self, dataloader):
+        print("TYPE:", type(dataloader), flush=True)
         outputs = {
             mod: {}
             for mod in self.modality_names
         }
 
-        for data, idx in dataloader:
+        self.clear_encoder_caches()
+        for data in dataloader:
+            idx = data["id"]
             for mod, encoder in self.encoders.items():
                 x_m = convert_modality_input(data, mod)
                 z_m, z_s, _ = encoder(x_m, training=False)
 
+                z_m_masked = self.modality_masks[mod].binary_mask * z_m
+                z_s_masked = self.shared_mask.binary_mask * z_s
                 z_m = z_m.numpy()
                 z_s = z_s.numpy()
                 indices = idx.numpy()
 
+
                 for i, sample_idx in enumerate(indices):
                     outputs[mod][int(sample_idx)] = {
                         "shared": z_s[i],
-                        "specific": z_m[i]
+                        "specific": z_m[i],
+                        "shared_masked": z_s_masked[i],
+                        "specific_masked": z_m_masked[i]
                     }
 
         return outputs
 
+    def clear_encoder_caches(self):
+        for encoder in self.encoders.values():
+            if hasattr(encoder, "clear_cache"):
+                encoder.clear_cache()
 
     
 class DeMuReFusionMI(DeMuReFusion): 
