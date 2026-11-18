@@ -83,7 +83,55 @@ class DeMuReFusion():
             self.modality_masks[modality_name].trainable = trainable
         self.shared_mask.trainable = trainable
 
-    
+    def load_encoder_for_inference(self):
+        ckpt_path = self.ckpt_path
+
+        for modal_name in self.modality_names:
+
+            encoder = self.encoders[modal_name]
+
+            # 1. Dummy inputs anhand des ursprünglichen Backbones erstellen
+            dummy_input = create_encoder_inputs(
+                encoder.backbone,
+                self.modality_shapes[modal_name]
+            )
+
+            # 2. Backbone aufrufen und Representation erzeugen
+            representation = encoder.backbone(
+                dummy_input,
+                training=False
+            )
+
+            # 3. Disentanglement-Heads bauen
+            encoder.heads(
+                representation,
+                training=False
+            )
+
+            # 4. Gesamten Encoder aufrufen
+            encoder(
+                dummy_input,
+                training=False
+            )
+
+            # 5. Gespeicherte Gewichte laden
+            weight_path = (
+                ckpt_path / f"{modal_name}_encoder.weights.h5"
+            )
+
+            encoder.load_weights(weight_path)
+
+            # 6. Encoder für Inferenz einfrieren
+            encoder.trainable = False
+
+            # Cache zurücksetzen
+            encoder.clear_cache()
+
+            print(f"Loaded encoder: {modal_name}")
+
+        print("All encoder weights successfully loaded.")
+
+
     def _add_disentangled_block(
         self,
         encoder: keras.models.Model,
@@ -163,7 +211,7 @@ class DeMuReFusion():
         #         layer.bias.assign(
         #             layer.bias_initializer(layer.bias.shape)
         #         )
-
+        
         return encoder, decoder
 
     def _add_disentangled_heads(
@@ -208,7 +256,17 @@ class DeMuReFusion():
             backbone=backbone_model,
             heads=heads_model
         )
-
+        dummy_inputs = tf.nest.map_structure(
+            lambda t: tf.zeros(
+                (1, *(d if d is not None else 16 for d in t.shape[1:])), 
+                dtype=t.dtype
+            ),
+            inputs
+        )
+        _ = encoder(dummy_inputs, training=False)
+        
+        encoder.clear_cache()
+                
         base_decoder = decoder
         reps = keras.layers.Input(
             shape=(z_m_size + z_s_size,),
@@ -245,6 +303,24 @@ class DeMuReFusion():
         self.shared_size_masked = int(np.sum(self.shared_mask.binary_mask))
         print('Percentage of selected features for shared z: ', tf.math.reduce_sum(self.shared_mask.binary_mask)/self.shared_size)
         print(np.array(tf.sigmoid(self.shared_mask.mask_logits)).tolist())
+
+    def load_from_tf_checkpoint(self, iter_round=4):
+
+        checkpoint = tf.train.Checkpoint(
+            encoders=self.encoders,
+            decoders=self.decoders,
+            shared_post_mean=self.shared_post_mean,
+            posterior_means=self.posterior_means,
+            shared_mask=self.shared_mask,
+            modality_masks=self.modality_masks
+        )
+
+        path = self.ckpt_path / f"fusion_checkpoint_iter{iter_round}"
+
+        status = checkpoint.read(str(path))
+        status.assert_consumed()
+
+        print(f"Checkpoint restored: {path}")
     
     def train(self, trainloader, lr_enc=0.001, lr_dec=0.001, epochs_enc=20, epochs_dec=20, iteration_count=30, temp_annealing='exponential', no_mask_epochs=None, extra_encoder_training=None):
         dec_loss, enc_loss, shared_loss, m_loss = [], [], [], []
@@ -374,21 +450,12 @@ class DeMuReFusion():
                         with tf.GradientTape() as tape:
                             loss = 0
                             trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
-                            
-                            #target_representation = self.generate_target_representation(data, mod)
-                            
-                            # noise regularisation 
+
+                            # draw from the distribution by adding noise 
 
                             batch_size = target_representation.shape[0]
                             noise_m = tf.random.normal(shape=(batch_size ,self.z_sizes[mod]), mean=0.0, stddev=0.1)
                             noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
-
-                            
-                            #prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
-                            
-                            #prev_input = convert_modality_input(data, prev_modality)
-    
-                            #_, z_s_other, _ = self.encoders[prev_modality](prev_input)
 
                             z_s_other = z_s_other+noise_s
                             z_m = z[batch_ind:batch_ind+batch_size]+noise_m
@@ -691,9 +758,11 @@ class DeMuReFusion():
 class DeMuReFusionMI(DeMuReFusion): 
     """
     implements a Mutual Information Loss function for the recreation error 
-    with a CLUB based Mutual Information estimation based on the batch size. 
+    with a CLUB and InfoNCE based Mutual Information estimation based on the batch size. 
     The Loss function is described as following: 
-    L = L_recreation + l_1 * MI( X; Z_shared , Z_specific)  
+    L = L_recreation + l_1 * MI(Z_shared ; Z_specific) - l_2 * MI(Z_mod1 ; Z_mod2)
+    The first additional Term is minimizing MI between the shared and specific Information in the same modality. 
+    The second term maximizes MI cross modality between the shared modalities.  
     """
     
     def __init__(self,
@@ -708,174 +777,254 @@ class DeMuReFusionMI(DeMuReFusion):
                  gamma=1,
                  mask=False,
                  beta=1,
-                 lr = 1e-4,
-                 batch_size = 100,
-                 num_iter = 5000,
-                 l1 = 0.5, 
-                 estimator_name = "CLUB"):
-        super().__init__(encoders, decoders, num_train_samples, z_sizes, shared_size, modality_names, modality_shapes, ckpt_path, gamma, mask, beta)
+                 representation_fns=None,
+                 mi_lr = 1e-4,
+                 mi_num_iter = 5,
+                 l1 = 0.1,
+                 l2 = 0.1):
+        super().__init__(encoders, decoders, num_train_samples, z_sizes, shared_size, modality_names, modality_shapes, ckpt_path, gamma, mask, beta, representation_fns)
         
-        self.mi_lr = lr
-        self.mi_batch_size = batch_size
-        self.mi_num_iter = num_iter
-        self.l1 = l1 # amount of MI on the Loss function 
-
+        self.mi_num_iter = mi_num_iter
+        self.l1 = l1 # amount of MI between shared und specific on the Loss function 
+        self.l2 = l2 # amount of MI between shared across modalities 
         # self.estimator_name = estimator_name
         # self.mi_estimators = eval(estimator_name)(self.sample_dim, self.sample_dim, self.hidden_size).cuda()
         # self.mi_optimizer = torch.optim.Adam(self.mi_estimator.parameters(), lr = lr)
 
-        self.estimator_name = estimator_name
-
-        self.mi_estimators = torch.nn.ModuleDict()
+        # Dictionaries for the specific-vs-shared estimators (CLUB)
+        self.mi_estimators = {}
         self.mi_optimizers = {}
 
-        for mod_name, z_size in self.z_sizes.items():
+        # 1. Shared MI estimator: maximizes MI between shared modalities -> uses InfoNCE
+        # Both inputs have dimension self.shared_size
+        shared_hidden_size = max(
+            64,
+            min(256, 2 * self.shared_size)
+        )
 
-            shared_dim = self.shared_size
+        self.shared_mi_estimator = InfoNCE(
+            x_dim=self.shared_size,
+            y_dim=self.shared_size,
+            hidden_size=shared_hidden_size
+        )
+
+        self.shared_mi_optimizer = tf.keras.optimizers.Adam(learning_rate=mi_lr)
+
+        # 2. Modality-specific MI estimators: minimizes MI between specific (x) and shared (y) -> uses CLUB
+        for mod_name, z_size in self.z_sizes.items():
             specific_dim = z_size
+            shared_dim = self.shared_size
 
             hidden_size = max(
                 64,
                 min(256, 2 * max(shared_dim, specific_dim))
             )
 
-            self.mi_estimators[mod_name] = eval(self.estimator_name)(
-                shared_dim,
-                specific_dim,
-                hidden_size
-            ).to("cuda")
-
-            self.mi_optimizers[mod_name] = torch.optim.Adam(
-                self.mi_estimators[mod_name].parameters(),
-                lr=lr
+            # Note: x_dim = specific_dim, y_dim = shared_dim to match estimator(z_m, z_s)
+            self.mi_estimators[mod_name] = CLUB(
+                x_dim=specific_dim,
+                y_dim=shared_dim,
+                hidden_size=hidden_size
             )
 
+            self.mi_optimizers[mod_name] = tf.keras.optimizers.Adam(learning_rate=mi_lr)
+
+
+
+
     def optimize_modality_latent(self, trainloader, lr, n_epochs, optimizers):
-            loss_fn = tf.keras.losses.MeanSquaredError()
-            loss_trend = []  
-            if self.mask:
-                for modality_name in self.modality_names:
-                    self.modality_masks[modality_name].trainable = False
-                self.shared_mask.trainable = True
-            
+        loss_fn = tf.keras.losses.MeanSquaredError()
+        loss_trend = []  
+        if self.mask:
+            for modality_name in self.modality_names:
+                self.modality_masks[modality_name].trainable = False
+            self.shared_mask.trainable = True
+        
+        for epoch in range(n_epochs):
+            batch_ind = 0
+            epoch_loss = []
+            for data in trainloader:
+                batch_loss = 0
+                batch_ids = data["id"]
+                for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
+                    mutual_info_est = 0 
+                    # calling the encoders with ids for caching 
+                    x_m = convert_modality_input(data, mod)
+                    _, _, target_representation = self.encoders[mod](x_m, idx=batch_ids, training=False)
+                    prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
+                    prev_input = convert_modality_input(data, prev_modality)
+                    _, z_s_other, _ = self.encoders[prev_modality](prev_input, idx = batch_ids, training=False)
+                
+                    with tf.GradientTape() as tape:
+                        loss = 0
+                        trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
+
+                        # noise regularisation 
+
+                        batch_size = target_representation.shape[0]
+                        noise_m = tf.random.normal(shape=(batch_size ,self.z_sizes[mod]), mean=0.0, stddev=0.1)
+                        noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
+
+                        z_s_other = z_s_other+noise_s
+                        z_m = z[batch_ind:batch_ind+batch_size]+noise_m
+                        mse = self.posterior_means[mod][batch_ind:batch_ind+batch_size]**2
+                        if self.mask:
+                            loss += (0.1*self.beta*(self.shared_mask.l1())+self.gamma*(self.shared_mask.entropy_regularization())) 
+                            z_s_other = self.shared_mask(z_s_other)
+                            z_m = self.modality_masks[mod](z_m)
+                        reconst = self.decoders[mod](tf.concat([z_m, z_s_other], -1))
+
+
+                        # MI estimation for every modality = mean posterior_m 
+                        mutual_info_est = self.mi_estimators[mod](z_m, z_s_other, training=False)
+                        
+                        
+                        # loss for embedding is using the calculated target before
+                        loss += loss_fn(target_representation, reconst)
+
+                        loss += 0.01*tf.reduce_mean(mse)
+
+                        # extended loss 
+                        loss += self.l1 * (mutual_info_est/self.n_modalitites)
+
+
+                        trainable_var.extend([self.posterior_means[mod]])
+                        trainable_var.extend(self.decoders[mod].trainable_variables)
+
+                    gradients = tape.gradient(loss, trainable_var)
+                    optimizers[m_ind].apply_gradients(zip(gradients, trainable_var))
+                    batch_loss += loss.numpy()
+                    del tape
+
+                    # MI estimator retrain to fit to changed latent space 
+                    # club estimates latent due to conditional propbability 
+                    # --> direction of inputs is relevant 
+                    # want to est MI based on model p(specific | shared) of the updated MI upper bound 
+
+                    z_m_updated = self.posterior_means[mod][batch_ind:batch_ind+batch_size] + noise_m
+                    self.train_CLUB(mod, z_m_updated, z_s_other)
+
+
+                batch_ind += batch_size     
+                epoch_loss.append(batch_loss) 
+            loss_trend.append(np.mean(epoch_loss))      
+        if not np.isnan(loss.numpy()):
+            np.save(
+                self.ckpt_path / "shared_mask",
+                self.shared_mask.mask_logits.numpy()
+            )
+
+            np.save(
+                self.ckpt_path / "shared_mask_bin",
+                self.shared_mask.binary_mask.numpy()
+            )
+
+            for mod, zm in self.posterior_means.items():
+                self.decoders[mod].save_weights(
+                    self.ckpt_path / f"{mod}_decoder.weights.h5"
+                )
+
+                np.save(
+                    self.ckpt_path / f"modality_z_{mod}",
+                    zm.numpy()
+                )
+        return loss_trend
+
+
+    def train_encoder(self, trainloader, lr, n_epochs, optimizers):
+            loss_trend = []
+            self._set_trainable_mask(trainable=False)
             for epoch in range(n_epochs):
                 batch_ind = 0
                 epoch_loss = []
-                for data,_ in trainloader:
+                for data in trainloader:
                     batch_loss = 0
-                    for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
+                    batch_ids = data["id"]
+                    for m_ind, (mod, encoder) in  enumerate(self.encoders.items()):
+                        x_m = convert_modality_input(data, mod)
+                        
+                        
+                        # caching inside the encoder and getting the representation from the backbone
+                        # to feed it into the heads inside the taped gradient to not store the backbone for backprop 
+                        # results in faster training with higher batchsize  
+                        rep = encoder.get_representation(x_m, idx=batch_ids)
+                        batch_size = rep.shape[0]
+
+                        prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
+                        prev_input = convert_modality_input(data, prev_modality)
+                        _, z_s_other, _ = self.encoders[prev_modality](prev_input, idx = batch_ids, training=False)
+                        
                         with tf.GradientTape() as tape:
-                            mutual_info_est = 0 
-                            loss = 0
-                            trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
-                            x_m = tf.convert_to_tensor(data[mod])
-                            batch_size = x_m.shape[0]
-                            noise_m = tf.random.normal(shape=(batch_size ,self.z_sizes[mod]), mean=0.0, stddev=0.1)
-                            noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
-                            prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
-                            # other modality shared vector 
-                            _, z_s_other, _ = self.encoders[prev_modality](tf.convert_to_tensor(data[prev_modality]))
-                            z_s_other = z_s_other+noise_s
-                            # modality specific part = posterior means modality specific 
-                            z_m = z[batch_ind:batch_ind+batch_size]+noise_m
-                            # MI estimation for every modality = mean posterior_m 
-                            mutual_info_est += self.mi_estimators[mod](z_m, z_s_other)
 
-                            mse = self.posterior_means[mod][batch_ind:batch_ind+batch_size]**2
+                            z_m, z_s, _ = encoder(inputs = x_m, representation = rep)
+                            shared_mse = (self.shared_post_mean[batch_ind:batch_ind+batch_size] - z_s)**2
+                            mod_mse = (self.posterior_means[mod][batch_ind:batch_ind+batch_size]-z_m)**2
+                            shared_loss = tf.reduce_sum(self.shared_mask(shared_mse), -1)/tf.reduce_sum(self.shared_mask.binary_mask)
+                            modality_loss = tf.reduce_sum(self.modality_masks[mod](mod_mse), -1)/tf.reduce_sum(self.modality_masks[mod].binary_mask)
+                            loss = 10*tf.reduce_mean(shared_loss) + tf.reduce_mean(modality_loss)
+                            
 
-                            if self.mask:
-                                loss += (0.1*self.beta*(self.shared_mask.l1())+self.gamma*(self.shared_mask.entropy_regularization())) 
-                                z_s_other = self.shared_mask(z_s_other)
-                                z_m = self.modality_masks[mod](z_m)
-                            reconst = self.decoders[mod](tf.concat([z_m, z_s_other], -1))
-                            loss += loss_fn(x_m, reconst)
-                            loss += 0.01*tf.reduce_mean(mse)
-                            # extended loss 
-                            loss += self.l1 * mutual_info_est
-                            trainable_var.extend([self.posterior_means[mod]])
-                            trainable_var.extend(self.decoders[mod].trainable_variables)
+
+                            # MI estimation, lower bound for MI maximization with InfoNCE estimator 
+                            z_s_masked = self.shared_mask(z_s) if self.mask else z_s
+                            z_s_other_masked = self.shared_mask(z_s_other) if self.mask else z_s_other
+                            
+                            cross_modal_mi_est = self.shared_mi_estimator(z_s_masked, z_s_other_masked, training=False)
+                            loss -= self.l2 * (cross_modal_mi_est / self.n_modalitites)
+
+                            trainable_var = encoder.trainable_variables
+                            
                         gradients = tape.gradient(loss, trainable_var)
                         optimizers[m_ind].apply_gradients(zip(gradients, trainable_var))
-                        batch_loss += loss.numpy()
                         del tape
 
-                        # MI estimator retrain to fit to changed latent space 
-                        # club estimates latent due to conditional propbability 
-                        # --> direction of inputs is relevant 
-                        # want to est MI based on model p(specific | shared)  
-                        x_samples, y_samples = z_m, z_s_other
-                        self.train_CLUB(mod, x_samples, y_samples)
+                        _, z_s_updated, _ = encoder(inputs=x_m, representation=rep, training=False)
+                        z_s_updated_masked = self.shared_mask(z_s_updated) if self.mask else z_s_updated
 
-                    batch_ind += batch_size     
-                    epoch_loss.append(batch_loss) 
-                loss_trend.append(np.mean(epoch_loss))      
-            if not np.isnan(loss.numpy()):
-                np.save(os.path.join(self.ckpt_path,'shared_mask'), self.shared_mask.mask_logits.numpy())
-                np.save(os.path.join(self.ckpt_path,'shared_mask_bin'), self.shared_mask.binary_mask.numpy())
-                for mod, zm in self.posterior_means.items():
-                    self.decoders[mod].save_weights(os.path.join(self.ckpt_path,"%s_decoder.weights.h5"%(mod)))
-                    np.save(os.path.join(self.ckpt_path,"modality_z_%s"%mod), zm.numpy())
-            return loss_trend
-        
-
-    def optimize_shared_latent(self, trainloader, lr, n_epochs, optimizers):
-            loss_fn = tf.keras.losses.MeanSquaredError()
-            loss_trend = []
-            if self.mask:
-                for modality_name in self.modality_names:
-                    self.modality_masks[modality_name].trainable = True
-                self.shared_mask.trainable = False
-            for epoch in range(n_epochs):
-                batch_ind = 0
-                epoch_loss = []
-                for data,_ in trainloader:
-                    batch_loss = 0
-                    for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
-                        with tf.GradientTape() as tape:
-                            trainable_var = [self.shared_post_mean]
-                            x_m = tf.convert_to_tensor(data[mod])
-                            batch_size = x_m.shape[0]
-                            mse = self.shared_post_mean[batch_ind:batch_ind+batch_size]**2           
-                            noise_m = tf.random.normal(shape=(batch_size ,self.z_sizes[mod]), mean=0.0, stddev=0.1)
-                            noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
-                            z_m = z[batch_ind:batch_ind+batch_size]+noise_m
-                            z_s = self.shared_post_mean[batch_ind:batch_ind+batch_size]+noise_s
-                            if self.mask:
-                                z_m = self.modality_masks[mod](z_m)
-                                z_s = self.shared_mask(z_s)
-                            loss = 0.01*tf.reduce_mean(mse)
-                            reconst = self.decoders[mod](tf.concat([z_m, z_s], -1))
-                            loss += loss_fn(x_m,reconst)
-                            # loss += 0.01*self._frobenius_distance_cosine(z_m, z_s)
-                            trainable_var.extend(self.decoders[mod].trainable_variables)
-                            if self.mask:
-                                trainable_var.extend([self.modality_masks[mod].mask_logits])
-                                loss += self.beta*(self.modality_masks[mod].l1()) + (self.gamma*self.modality_masks[mod].entropy_regularization())
-                        gradients = tape.gradient(loss, trainable_var)
-                        optimizers[m_ind].apply_gradients(zip(gradients, trainable_var))
+                        # 3. InfoNCE-Schätzer auf dem neuen z_s nachziehen
+                        self.train_InfoNCE(z_s_updated_masked, z_s_other_masked)
                         batch_loss += loss.numpy()
-                        del tape 
+                    
                     batch_ind += batch_size 
-                    epoch_loss.append(batch_loss) 
+                    epoch_loss.append(batch_loss)
                 loss_trend.append(np.mean(epoch_loss))  
             if not np.isnan(loss.numpy()):
-                for mod, zm in self.posterior_means.items():
-                    self.decoders[mod].save_weights(os.path.join(self.ckpt_path,"/%s_decoder.weights.h5"%(mod)))
-                    np.save(os.path.join(self.ckpt_path,'mask_%s'%mod), self.modality_masks[mod].mask_logits.numpy())
-                    np.save(os.path.join(self.ckpt_path,'mask_%s_bin'%mod), self.modality_masks[mod].binary_mask.numpy())
-                np.save(os.path.join(self.ckpt_path,"shared_z"), self.shared_post_mean.numpy())
+                for (mod, encoder) in self.encoders.items():
+                    encoder.save_weights(self.ckpt_path / f"{mod}_encoder.weights.h5")
             return loss_trend
 
-    def train_CLUB(self, mod, x_samples, y_samples): 
-        for j in range(5):
-            self.mi_estimators[mod].train()
-            mi_loss = self.mi_estimators[mod].learning_loss(x_samples, y_samples)
-            self.mi_optimizers[mod].zero_grad()
-            mi_loss.backward()
-            self.mi_optimizers[mod].step()
-        return 
+    def train_CLUB(self, mod, x_samples, y_samples):
+        # Detach inputs so gradients only update the CLUB estimator, not the encoders/latents
+        x_detached = tf.stop_gradient(x_samples)
+        y_detached = tf.stop_gradient(y_samples)
+
+        for j in range(self.mi_num_iter):  # e.g., 5 iterations
+            with tf.GradientTape() as tape:
+                mi_loss = self.mi_estimators[mod].learning_loss(x_detached, y_detached)
+            
+            gradients = tape.gradient(mi_loss, self.mi_estimators[mod].trainable_variables)
+            self.mi_optimizers[mod].apply_gradients(
+                zip(gradients, self.mi_estimators[mod].trainable_variables)
+            )
+        return
+
+    def train_InfoNCE(self, x_samples, y_samples):
+        # Detach inputs so gradients only update the InfoNCE critic
+        x_detached = tf.stop_gradient(x_samples)
+        y_detached = tf.stop_gradient(y_samples)
+
+        for j in range(self.mi_num_iter):
+            with tf.GradientTape() as tape:
+                mi_loss = self.shared_mi_estimator.learning_loss(x_detached, y_detached)
+            
+            gradients = tape.gradient(mi_loss, self.shared_mi_estimator.trainable_variables)
+            self.shared_mi_optimizer.apply_gradients(
+                zip(gradients, self.shared_mi_estimator.trainable_variables)
+            )
+        return
 
 
+    
 class LearnableMask(keras.layers.Layer):
     def __init__(self, input_dim, straight_through=True, init_mask_val=0, initial_temperature=1, final_temperature=0.2):
         super(LearnableMask, self).__init__()
@@ -973,83 +1122,3 @@ def convert_modality_input(data, modality):
 
 
 
-
-
-
-
-
-# def optimize_modality_latent(self, trainloader, lr, n_epochs, optimizers):
-#         loss_fn = tf.keras.losses.MeanSquaredError()
-#         loss_trend = []  
-#         if self.mask:
-#             for modality_name in self.modality_names:
-#                 self.modality_masks[modality_name].trainable = False
-#             self.shared_mask.trainable = True
-        
-#         for epoch in range(n_epochs):
-#             batch_ind = 0
-#             epoch_loss = []
-#             for data in trainloader:
-#                 print("\n========== DATA DEBUG ==========")
-#                 print("Data type:", type(data))
-
-#                 if isinstance(data, dict):
-#                     print("Keys:", data.keys())
-
-#                     for mod, value in data.items():
-#                         print(f"\nModality: {mod}")
-#                         print("Type:", type(value))
-
-#                         if isinstance(value, dict):
-#                             for key, tensor in value.items():
-#                                 print(f"  {key}: shape={tensor.shape}, dtype={tensor.dtype}")
-#                         else:
-#                             print("Shape:", value.shape)
-#                             print("Dtype:", value.dtype)
-
-#                 else:
-#                     print("Data:", data)
-
-
-#                 batch_loss = 0
-#                 for m_ind, (mod, z) in enumerate(self.posterior_means.items()):
-#                     with tf.GradientTape() as tape:
-#                         loss = 0
-#                         trainable_var = [self.shared_mask.mask_logits] if (self.mask) else []
-#                         x_m = convert_modality_input(data, mod)
-#                         batch_size = x_m.shape[0]
-#                         noise_m = tf.random.normal(shape=(batch_size ,self.z_sizes[mod]), mean=0.0, stddev=0.1)
-#                         noise_s = tf.random.normal(shape=(batch_size ,self.shared_size), mean=0.0, stddev=0.1)
-#                         prev_modality = self.modality_names[m_ind-1 if m_ind>0 else self.n_modalitites-1]
-                        
-#                         prev_input = convert_modality_input(data, prev_modality)
-
-#                         _, z_s_other, _ = self.encoders[prev_modality](prev_input)
-
-#                         #_, z_s_other, _ = self.encoders[prev_modality](tf.convert_to_tensor(data[prev_modality]))
-#                         z_s_other = z_s_other+noise_s
-#                         z_m = z[batch_ind:batch_ind+batch_size]+noise_m
-#                         mse = self.posterior_means[mod][batch_ind:batch_ind+batch_size]**2
-#                         if self.mask:
-#                             loss += (0.1*self.beta*(self.shared_mask.l1())+self.gamma*(self.shared_mask.entropy_regularization())) 
-#                             z_s_other = self.shared_mask(z_s_other)
-#                             z_m = self.modality_masks[mod](z_m)
-#                         reconst = self.decoders[mod](tf.concat([z_m, z_s_other], -1))
-#                         loss += loss_fn(x_m, reconst)
-#                         loss += 0.01*tf.reduce_mean(mse)
-#                         trainable_var.extend([self.posterior_means[mod]])
-#                         trainable_var.extend(self.decoders[mod].trainable_variables)
-#                     gradients = tape.gradient(loss, trainable_var)
-#                     optimizers[m_ind].apply_gradients(zip(gradients, trainable_var))
-#                     batch_loss += loss.numpy()
-#                     del tape
-#                 batch_ind += batch_size     
-#                 epoch_loss.append(batch_loss) 
-#             loss_trend.append(np.mean(epoch_loss))      
-#         if not np.isnan(loss.numpy()):
-#             np.save(os.path.join(self.ckpt_path,'shared_mask'), self.shared_mask.mask_logits.numpy())
-#             np.save(os.path.join(self.ckpt_path,'shared_mask_bin'), self.shared_mask.binary_mask.numpy())
-#             for mod, zm in self.posterior_means.items():
-#                 self.decoders[mod].save_weights(os.path.join(self.ckpt_path,"%s_decoder.weights.h5"%(mod)))
-#                 np.save(os.path.join(self.ckpt_path,"modality_z_%s"%mod), zm.numpy())
-#         return loss_trend

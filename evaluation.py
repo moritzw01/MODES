@@ -4,64 +4,6 @@ from data import Multimodal3DIdent
 from torch.utils.data import DataLoader
 from pathlib import Path
 
-
-from utils import collate_multimodal_fn
-from fusion import DeMuReFusion
-import numpy as np 
-# data_dir = Path("")
-# M1, M2 = "image", "text"
-
-# trainset = Multimodal3DIdent(data_dir, mode="train", modality_names= (M1, M2))
-# valset = Multimodal3DIdent(data_dir, mode="val", modality_names= (M1, M2))
-# testset = Multimodal3DIdent(data_dir, mode="test", modality_names= (M1, M2))
-# train_loader = DataLoader(trainset, batch_size=64, shuffle=False, drop_last=False, collate_fn=collate_multimodal_fn)
-# valid_loader = DataLoader(valset, batch_size=64, shuffle=False, drop_last=False, collate_fn=collate_multimodal_fn)
-# test_loader = DataLoader(testset, batch_size=64, shuffle=False, drop_last=False, collate_fn=collate_multimodal_fn)
-
-# model = DeMuReFusion()
-
-
-# # dict with modality specific representations z_m, z_s per sample 
-# # z_s = outputs[modality][idx][shared] as numpy array 
-# train_outputs = model.get_encoder_outputs(train_loader)
-# valid_outputs = model.get_encoder_outputs(valid_loader)
-# test_outputs = model.get_encoder_outputs(test_loader)
-
-factors = ["object_shape", "text_phrasing", "spotlight_position"]
-# object shape is a shared variable classification, tetx phrasing text specific classification 
-# and spotlight position image specific regression task 
-# def train_and_predict(outputs: dict, outputs_test: dict, dataloader:DataLoader): 
-#     prediction_results = {
-#         factor: {
-#             mod: {
-#                 "shared": None,
-#                 "specific": None,
-#                 "both": None
-#             }
-#             for mod,_ in outputs.items()
-#         }
-#         for factor in factors
-#     }
-
-#     for mod, id_dict in outputs.items(): 
-#         for factor in factors: 
-#             if factor == "object_shape" or factor == "text_phrasing": 
-#                 #classification 
-#                 experiments = []
-#                 for id, z_dict in id_dict.items(): 
-#                     z_s, z_m = z_dict["shared"], z_dict["specific"]
-#                     sample = dataloader[id]
-                    
-#                     x = [z_m, z_s, np.concat((z_m, z_s))]
-#                     experiments.append(x)
-
-
-
-#                     gt = sample[mod].z[factor]
-
-
-
-
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -71,7 +13,7 @@ from sklearn.metrics import accuracy_score, r2_score, roc_auc_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-
+import time
 # ==========================================
 # 1. ADAPTER (Train vs. Test Split)
 # ==========================================
@@ -85,8 +27,10 @@ def _extract_single_split(outputs: dict, dataloader, factors: tuple):
     direkt aus `dataloader.dataset.labels` (ohne Bilder von der Festplatte zu laden!).
     """
     dataset = getattr(dataloader, "dataset", dataloader)
+    
     modalities = list(outputs.keys())
-    sample_ids = sorted(outputs[modalities].keys())
+    first_mod = modalities[0] if isinstance(modalities, (list, tuple)) else modalities
+    sample_ids = sorted(outputs[first_mod].keys())
 
     z_dict = {mod: {"shared": [], "specific": [], "both": []} for mod in modalities}
 
@@ -129,7 +73,7 @@ def adapt_train_test_for_paper_eval(
     test_outputs: dict,
     train_loader,
     test_loader,
-    factors=("object_shape", "text_phrasing", "spotlight_position")
+    factors=("object_shape", "text_phrasing", "spotlight_pos")
 ):
     z_tr, y_tr = _extract_single_split(train_outputs, train_loader, factors)
     z_te, y_te = _extract_single_split(test_outputs, test_loader, factors)
@@ -152,62 +96,86 @@ def adapt_train_test_for_paper_eval(
 
 def phenotype_predictor(
     z_train, y_train, z_test, y_test, phenotypes, kfold_indices,
-    regression_phenos=("spotlight_position",), mask=None, n_pca=None
+    regression_phenos=("spotlight_pos",), mask=None, n_pca=None
 ):
     phenotypes_scores = {}
     if mask is not None:
         if tf.reduce_sum(mask) == 0:
             for pheno in phenotypes:
-                phenotypes_scores[pheno] = (0, 0)
+                # Einheitliches Format [[train_scores], [test_scores]]
+                phenotypes_scores[pheno] = [[0.0], [0.0]]
             return phenotypes_scores
         z_test = np.take(z_test, np.argwhere(mask == 1)[:, 0], axis=1)
         z_train = np.take(z_train, np.argwhere(mask == 1)[:, 0], axis=1)
 
     for pheno in phenotypes:
+        start = time.perf_counter()
+        print(f"starting with {pheno}", flush=True)
         if n_pca == 0 or z_train.shape[-1] == 0:
-            phenotypes_scores[pheno] = [[0], [0]]
+            phenotypes_scores[pheno] = [[0.0], [0.0]]
             continue
 
-        n_classes = len(np.unique(y_train[pheno].to_numpy()))
         is_regression = pheno in regression_phenos
-
+        print(is_regression, pheno, phenotypes, regression_phenos, flush=True)
         # --- Zweig A: Regression (spotlight_position) ---
         if is_regression:
             r2_test, r2_train = [], []
             for (train_index, test_index) in kfold_indices:
-                predictor = make_pipeline(StandardScaler(with_mean=True), Ridge(solver='lsqr', max_iter=250000))
+                predictor = make_pipeline(
+                    StandardScaler(with_mean=True),
+                    Ridge(solver="lsqr", max_iter=250000)
+                )
                 X_train, X_test = z_train[train_index], z_train[test_index]
                 Y_train, Y_test = y_train[pheno].to_numpy()[train_index], y_train[pheno].to_numpy()[test_index]
+
                 if n_pca is not None and n_pca < X_train.shape[-1]:
                     pca = PCA(n_components=n_pca)
                     X_train = pca.fit_transform(X_train)
                     X_test = pca.transform(X_test)
+
                 predictor.fit(X_train, Y_train)
                 r2_test.append(r2_score(Y_test, predictor.predict(X_test)))
                 r2_train.append(r2_score(Y_train, predictor.predict(X_train)))
             phenotypes_scores[pheno] = [r2_train, r2_test]
+
+        # --- Zweig B: Klassifikation ---
         else:
             acc_test, acc_train = [], []
             for (train_index, test_index) in kfold_indices:
-                # Multinomiale LogisticRegression erzeugt saubere Softmax-Klassengebiete
-                predictor = LogisticRegression(penalty='elasticnet', solver='saga', class_weight='balanced', l1_ratio=0.5, max_iter=1000)
+                # StandardScaler verhindert ConvergenceWarning beim saga-Solver
+                predictor = make_pipeline(
+                    StandardScaler(with_mean=True),
+                    LogisticRegression(
+                        penalty="elasticnet",
+                        solver="saga",
+                        class_weight="balanced",
+                        l1_ratio=0.5,
+                        max_iter=3000
+                    )
+                )
                 X_train, X_test = z_train[train_index], z_train[test_index]
                 Y_train, Y_test = y_train[pheno].to_numpy()[train_index], y_train[pheno].to_numpy()[test_index]
+
                 if n_pca is not None and n_pca < X_train.shape[-1]:
                     pca = PCA(n_components=n_pca)
                     X_train = pca.fit_transform(X_train)
                     X_test = pca.transform(X_test)
+
                 predictor.fit(X_train, Y_train)
                 acc_test.append(accuracy_score(Y_test, predictor.predict(X_test)))
                 acc_train.append(accuracy_score(Y_train, predictor.predict(X_train)))
             phenotypes_scores[pheno] = [acc_train, acc_test]
+
+        print(f"predicted {pheno}: {time.perf_counter() - start:.2f}s, {phenotypes_scores[pheno]}",
+                        flush=True
+                    )
 
     return phenotypes_scores
 
 
 def phenotype_predictor_lf(
     z_train_1, y_train_1, z_train_2, y_train_2, phenotypes, kfold_indices,
-    regression_phenos=("spotlight_position",)
+    regression_phenos=("spotlight_pos",)
 ):
     phenotypes_scores = {}
     for pheno in phenotypes:
@@ -218,8 +186,8 @@ def phenotype_predictor_lf(
         if is_regression:
             r2_test, r2_train = [], []
             for (train_index, test_index) in kfold_indices:
-                predictor_1 = SGDRegressor()
-                predictor_2 = SGDRegressor()
+                predictor_1 = make_pipeline(StandardScaler(), Ridge(solver="lsqr", max_iter=250000))
+                predictor_2 = make_pipeline(StandardScaler(), Ridge(solver="lsqr", max_iter=250000))
                 predictor_1.fit(z_train_1[train_index], y_train_1[pheno].to_numpy()[train_index])
                 predictor_2.fit(z_train_2[train_index], y_train_2[pheno].to_numpy()[train_index])
 
@@ -234,13 +202,14 @@ def phenotype_predictor_lf(
         elif n_classes == 2:
             auc_test, auc_train = [], []
             for (train_index, test_index) in kfold_indices:
-                predictor_1 = SGDClassifier()
-                predictor_2 = SGDClassifier()
+                predictor_1 = make_pipeline(StandardScaler(), SGDClassifier(loss="log_loss"))
+                predictor_2 = make_pipeline(StandardScaler(), SGDClassifier(loss="log_loss"))
                 predictor_1.fit(z_train_1[train_index], y_train_1[pheno].to_numpy()[train_index])
                 predictor_2.fit(z_train_2[train_index], y_train_2[pheno].to_numpy()[train_index])
 
-                z_pred_train = (predictor_1.predict(z_train_1[train_index]) + predictor_2.predict(z_train_2[train_index])) / 2
-                z_pred = (predictor_1.predict(z_train_1[test_index]) + predictor_2.predict(z_train_2[test_index])) / 2
+                # Wahrscheinlichkeiten der positiven Klasse mitteln für sauberen ROC-AUC
+                z_pred_train = (predictor_1.predict_proba(z_train_1[train_index])[:, 1] + predictor_2.predict_proba(z_train_2[train_index])[:, 1]) / 2
+                z_pred = (predictor_1.predict_proba(z_train_1[test_index])[:, 1] + predictor_2.predict_proba(z_train_2[test_index])[:, 1]) / 2
 
                 auc_test.append(roc_auc_score(y_train_1[pheno].to_numpy()[test_index], z_pred))
                 auc_train.append(roc_auc_score(y_train_1[pheno].to_numpy()[train_index], z_pred_train))
@@ -250,12 +219,23 @@ def phenotype_predictor_lf(
         else:
             acc_test, acc_train = [], []
             for (train_index, test_index) in kfold_indices:
-                predictor_1 = SGDClassifier(loss="log_loss")
-                predictor_2 = SGDClassifier(loss="log_loss")
+                predictor_1 = make_pipeline(StandardScaler(), SGDClassifier(loss="log_loss"))
+                predictor_2 = make_pipeline(StandardScaler(), SGDClassifier(loss="log_loss"))
                 predictor_1.fit(z_train_1[train_index], y_train_1[pheno].to_numpy()[train_index])
                 predictor_2.fit(z_train_2[train_index], y_train_2[pheno].to_numpy()[train_index])
 
                 probs_train = (predictor_1.predict_proba(z_train_1[train_index]) + predictor_2.predict_proba(z_train_2[train_index])) / 2
+                probs_test = (predictor_1.predict_proba(z_train_1[test_index]) + predictor_2.predict_proba(z_train_2[test_index])) / 2
+
+                classes = predictor_1.classes_
+                y_pred_train = classes[np.argmax(probs_train, axis=1)]
+                y_pred_test = classes[np.argmax(probs_test, axis=1)]
+
+                acc_test.append(accuracy_score(y_train_1[pheno].to_numpy()[test_index], y_pred_test))
+                acc_train.append(accuracy_score(y_train_1[pheno].to_numpy()[train_index], y_pred_train))
+            phenotypes_scores[pheno] = [acc_train, acc_test]
+
+    return phenotypes_scores
 
                 
 import matplotlib.pyplot as plt
@@ -268,8 +248,8 @@ def run_eval_to_csv_and_plot(
     test_outputs: dict,
     train_loader,
     test_loader,
-    factors=("object_shape", "text_phrasing", "spotlight_position"),
-    regression_phenos=("spotlight_position",),
+    factors=("object_shape", "text_phrasing", "spotlight_pos"),
+    regression_phenos=("spotlight_pos",),
     csv_path="disentanglement_results.csv",
     plot_path="disentanglement_plot.png"
 ):
@@ -317,12 +297,14 @@ def run_eval_to_csv_and_plot(
                     "Metric": metric_name,
                     "Source": mod,
                     "Representation": rep_type,
-                    "Train_Score": float(res[factor]),
-                    "Test_Score": float(res[factor]),
+                    "Train_Score": float(np.mean(res[factor][0])),
+                    "Test_Score": float(np.mean(res[factor][1])),
+
                 })
 
         # 2. Late Fusion Auswertung (beide Modalitäten gemittelt)
         if len(modalities) == 2:
+            mod1, mod2 = modalities
             for rep_type in rep_types:
                 res_lf = phenotype_predictor_lf(
                     z_train_1=z_all[mod1][rep_type],
@@ -338,8 +320,8 @@ def run_eval_to_csv_and_plot(
                     "Metric": metric_name,
                     "Source": "late_fusion",
                     "Representation": rep_type,
-                    "Train_Score": float(res_lf[factor]),
-                    "Test_Score": float(res_lf[factor]),
+                    "Train_Score": float(np.mean(res_lf[factor][0])),
+                    "Test_Score": float(np.mean(res_lf[factor][1])),
                 })
 
     # DataFrame erstellen und als CSV speichern
@@ -367,16 +349,24 @@ def run_eval_to_csv_and_plot(
 
     for ax, factor in zip(axes, factors):
         sub_df = df[df["Factor"] == factor]
-        metric_label = sub_df["Metric"].iloc
+        metric_label = sub_df["Metric"].iloc[0]
 
         for i, rep_type in enumerate(rep_types):
             rep_scores = []
             for src in sources:
                 val = sub_df[(sub_df["Source"] == src) & (sub_df["Representation"] == rep_type)]["Test_Score"].values
-                rep_scores.append(val if len(val) > 0 else 0.0)
+                rep_scores.append(float(val[0]) if len(val) > 0 else 0.0)
 
             offset = (i - 1) * width
-            bars = ax.bar(x + offset, rep_scores, width, label=rep_type.capitalize(), color=colors[rep_type], edgecolor="black", linewidth=0.6)
+            bars = ax.bar(
+                x + offset,
+                rep_scores,
+                width,
+                label=rep_type.capitalize(),
+                color=colors[rep_type],
+                edgecolor="black",
+                linewidth=0.6
+            )
 
             # Werte direkt über die Balken schreiben
             for bar in bars:
@@ -402,7 +392,7 @@ def run_eval_to_csv_and_plot(
         ax.spines["right"].set_visible(False)
 
     # Gemeinsame Legende oben mittig
-    handles, labels = axes.get_legend_handles_labels()
+    handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, fontsize=10, bbox_to_anchor=(0.5, 1.03))
 
     plt.tight_layout(rect=[0, 0, 1, 0.94])
@@ -411,6 +401,3 @@ def run_eval_to_csv_and_plot(
     print(f"Plot erfolgreich gespeichert unter: {plot_path}")
 
     return df
-
-
-        
