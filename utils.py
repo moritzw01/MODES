@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 import tensorflow as tf
 import numpy as np
 import random
-
+import keras_hub
 # from ml4h.tensormap.ukb.ecg import ecg_rest_median_raw_10
 # from ml4h.tensormap.ukb.mri import lax_4ch_heart_center
 # from ml4h.tensormap.ukb.mri_brain import t1_mni_slices_128_160
@@ -28,33 +28,76 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from data import Multimodal3DIdent, MultimodalUKBDataset, MultiModalSample
 
-class MultimodalUKBDataset(Dataset):
-    def __init__(self, paths, file_names):
-        self.paths = paths
-        self.file_names = file_names
+import numpy as np
 
-    def __len__(self):
-        return len(self.file_names)
+
+def collate_multimodal_fn(batch):
+
+    collated_data = {}
     
-    def batch_normalize(self,x, std=1):
-        return std*(x-torch.mean(x))/torch.std(x)
+    collated_data["id"] = torch.tensor(
+        [item.idx for item in batch],
+        dtype=torch.long
+    )
 
-    def __getitem__(self, idx):
-        sample_id = self.file_names[idx].split('.')[0]
-        samples = {}
-        for modal_name, p in self.paths.items():
-            sample_path = os.path.join(p, self.file_names[idx])
-            with h5py.File(f'{sample_path}', 'r') as hd5:
-                if "ecg" in modal_name:
-                    sample = ecg_rest_median_raw_10.normalize(ecg_rest_median_raw_10.tensor_from_file(ecg_rest_median_raw_10, hd5))
-                elif "lax" in modal_name:
-                    sample = lax_4ch_heart_center.normalize(lax_4ch_heart_center.tensor_from_file(lax_4ch_heart_center, hd5))
-                elif "axial" in modal_name:
-                    sample = t1_mni_slices_128_160.normalize(t1_mni_slices_128_160.tensor_from_file(t1_mni_slices_128_160, hd5))
-            samples[modal_name] = (torch.Tensor(sample))
-        return samples, int(sample_id)
+    for mod in batch[0].mod_names:
 
+        modality_data = batch[0].modalities[mod].data
+
+        if isinstance(modality_data, dict):
+            collated_data[mod] = {
+                key: torch.stack([
+                    item.modalities[mod].data[key]
+                    for item in batch
+                ])
+                for key in modality_data
+            }
+
+        else:
+            collated_data[mod] = torch.stack([
+                item.modalities[mod].data
+                for item in batch
+            ])
+
+    return collated_data
+
+def get_dataloader_input_size(dataloader: DataLoader):
+    """
+    Returns the input shape of each modality in the first batch.
+    """
+    batch = next(iter(dataloader))
+
+    input_dims = {}
+    for mod, data in batch.items():
+
+        if isinstance(data, dict):
+            input_dims[mod] = {
+                key: tensor.shape[1:]
+                for key, tensor in data.items()
+            }
+
+        else:
+            input_dims[mod] = data.shape[1:]
+
+    return input_dims
+
+def print_sample_shapes(item, prefix=""):
+    """
+    Durchläuft ein Sample (Dict, Liste, Tensor etc.) rekursiv 
+    und gibt die Shapes aller enthaltenen PyTorch-Tensoren aus.
+    """
+    if isinstance(item, dict):
+        for key, value in item.items():
+            print_sample_shapes(value, prefix=f"{prefix}.{key}" if prefix else key)
+    elif isinstance(item, (list, tuple)):
+        for i, value in item.items() if hasattr(item, 'items') else enumerate(item):
+            print_sample_shapes(value, prefix=f"{prefix}[{i}]")
+    elif torch.is_tensor(item):
+        print(f"  {prefix}: {item.shape}")
+    else:
+        print(f"  {prefix}: {type(item)} (kein Tensor)")
 
 def load_pretrained_models(decoder_path_1, encoder_path_1, decoder_path_2, encoder_path_2):
     decoder_1 = tf.keras.models.load_model(decoder_path_1)
@@ -65,6 +108,16 @@ def load_pretrained_models(decoder_path_1, encoder_path_1, decoder_path_2, encod
     decoder_1 = randomize_model_weight(decoder_1)
     decoder_2 = randomize_model_weight(decoder_2)
     return decoder_1, encoder_1, decoder_2, encoder_2
+
+def load_pretrained_hub_models(encoder_preset_1,
+                               encoder_preset_2): 
+    encoder1 = keras_hub.models.DINOV2Backbone.from_preset(
+            encoder_preset_1
+        )
+    encoder2 = keras_hub.models.BertBackbone.from_preset(
+        encoder_preset_2
+    )
+    return encoder1, encoder2
 
 
 def load_data(sample_list, data_paths, n_train=None, test_ratio=0.01, data='UKB', get_trainset=False):
